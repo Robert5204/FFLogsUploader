@@ -1,0 +1,35 @@
+# Build output
+bin/
+obj/
+out/
+
+# Build logs
+*.log
+build_output.txt
+
+# NuGet
+packages/
+*.nupkg
+.nuget/
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.csproj.user
+
+# Rider
+.idea/
+*.sln.iml
+
+# Dalamud/XIVLauncher
+devPlugins/
+
+# Misc
+*.tmp
+*.bak
+*.swp
+*~
