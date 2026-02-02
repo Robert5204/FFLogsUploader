@@ -23,8 +23,8 @@ jobs:
 
       - name: Download Dalamud
         run: |
-          curl -L https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -o dalamud.zip
-          unzip dalamud.zip -d ~/dalamud
+          wget -q https://goatcorp.github.io/dalamud-distrib/latest.zip -O dalamud.zip || curl -sL https://goatcorp.github.io/dalamud-distrib/latest.zip -o dalamud.zip
+          unzip -q dalamud.zip -d ~/dalamud
 
       - name: Build
         run: |
