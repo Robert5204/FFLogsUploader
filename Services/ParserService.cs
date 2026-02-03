@@ -383,6 +383,14 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
     {
         await StartParserProcessAsync();
 
+        var fights = new List<FightData>();
+        long startTime = 0;
+        long endTime = 0;
+        string masterStr = "";
+
+        try
+        {
+
         Plugin.Log.Information($"[Parser] Processing log: {Path.GetFileName(logPath)}");
 
         // Read log file with sharing enabled (ACT may have it open)
@@ -467,7 +475,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         }
 
         // Process results - try multiple formats
-        var fights = new List<FightData>();
+        // fights declared outside
         
         JsonElement? fightsArray = null;
         
@@ -506,8 +514,8 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         Plugin.Log.Information($"[Parser] Extracted {fights.Count} fights");
 
         // Get global timestamps from fights result
-        long startTime = 0;
-        long endTime = 0;
+        // Get global timestamps from fights result
+        // vars startTime, endTime declared outside
         if (fightsResult.HasValue)
         {
             var fr = fightsResult.Value;
@@ -516,12 +524,19 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         }
 
         // Build master table string - header comes from fights, sections from master
-        var masterStr = "";
+        // Build master table string - header comes from fights, sections from master
+        // var masterStr declared outside
         if (masterResult.HasValue)
         {
             // Get header info from fights result (logVersion, gameVersion, logFileDetails)
             JsonElement? fightsHeader = fightsResult;
             masterStr = BuildMasterTableString(fightsHeader, masterResult.Value);
+        }
+
+        }
+        finally
+        {
+            StopParser(); // Auto-close Node process after manual upload
         }
 
         return (masterStr, fights, startTime, endTime);
@@ -586,6 +601,8 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         CancellationToken cancellationToken = default)
     {
         await StartParserProcessAsync();
+        try
+        {
         
         // Note: Report code is no longer needed here - it's set when uploading
 
@@ -624,6 +641,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         DateTime lastFileCheckTime = DateTime.UtcNow;
         bool checkPending = false;
         long lastPosition = 0;
+        bool firstPass = true;
 
         // If not uploading previous fights, skip to end of file
         if (!uploadPreviousFights)
@@ -659,9 +677,18 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                         raidsToUpload = Array.Empty<object>()
                     });
                     
-                    // Drain any responses without blocking
-                    await Task.Delay(100, cancellationToken);
-                    lock (queueLock) ipcQueue.Clear();
+                    // Give parser time to process
+                    // If this is the initial large read, wait longer
+                    if (firstPass && uploadPreviousFights && newLines.Count > 1000)
+                    {
+                         await Task.Delay(Math.Max(500, newLines.Count / 100), cancellationToken);
+                    }
+                    else
+                    {
+                         await Task.Delay(100, cancellationToken);
+                    }
+                    
+                    // Note: Don't clear IPC queue here - we need the parser responses later!
                 }
 
                 // Check for a newer log file every 60 seconds (for multi-day sessions)
@@ -682,90 +709,21 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 }
                 
                 // Check if idle for 5+ seconds
+                // Check if idle for 5+ seconds OR if we should force a check (initial read)
                 var idleTime = (DateTime.UtcNow - lastActivityTime).TotalSeconds;
-                if (idleTime > 5.0 && !checkPending)
+                bool forceCheck = firstPass && uploadPreviousFights;
+
+                if ((idleTime > 5.0 || forceCheck) && !checkPending)
                 {
+                    if (forceCheck) firstPass = false;
                     checkPending = true;
-                    Plugin.Log.Debug($"[LiveLog] Idle for {idleTime:F1}s - checking for new fights");
+                    if (forceCheck)
+                        Plugin.Log.Debug($"[LiveLog] Initial read complete - checking for fights immediately");
+                    else
+                        Plugin.Log.Debug($"[LiveLog] Idle for {idleTime:F1}s - checking for new fights");
                     
                     // Collect fights
-                    await SendMessageAsync(new
-                    {
-                        message = "collect-fights",
-                        id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        pushFightIfNeeded = false,
-                        scanningOnly = false
-                    });
-                    
-                    var fightsResult = await WaitForKeyAsync("fights", 5000);
-                    
-                    if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
-                    {
-                        var currentCount = fightsArray.GetArrayLength();
-                        
-                        if (currentCount > lastFightCount)
-                        {
-                            var newCount = currentCount - lastFightCount;
-                            Plugin.Log.Information($"[LiveLog] {newCount} NEW fight(s) detected!");
-                            
-                            // Get master data
-                            await SendMessageAsync(new
-                            {
-                                message = "collect-master-info",
-                                id = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                            });
-                            
-                            var masterResult = await WaitForKeyAsync("actorsString", 5000);
-                            
-                            if (masterResult.HasValue)
-                            {
-                                // Log what we got for debugging
-                                Plugin.Log.Debug($"[LiveLog] fightsResult has logVersion: {fightsResult.Value.TryGetProperty("logVersion", out var lv)}");
-                                Plugin.Log.Debug($"[LiveLog] masterResult has actorsString: {masterResult.Value.TryGetProperty("actorsString", out var ac)}");
-                                if (ac.ValueKind == JsonValueKind.String)
-                                    Plugin.Log.Debug($"[LiveLog] actorsString length: {ac.GetString()?.Length ?? 0}");
-                                
-                                // Get global timestamps from fights result (like Python's header_data)
-                                var fr = fightsResult.Value;
-                                long globalStartTime = fr.TryGetProperty("startTime", out var gst) ? gst.GetInt64() : 0;
-                                long globalEndTime = fr.TryGetProperty("endTime", out var get) ? get.GetInt64() : globalStartTime;
-                                Plugin.Log.Debug($"[LiveLog] Global timestamps: {globalStartTime} - {globalEndTime}");
-                                
-                                // Build master string
-                                var masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
-                                Plugin.Log.Debug($"[LiveLog] Built master table: {masterStr.Length} chars");
-                                
-                                // Upload only NEW fights
-                                var fights = new List<FightData>();
-                                int i = 0;
-                                foreach (var fight in fightsArray.EnumerateArray())
-                                {
-                                    if (i >= lastFightCount)
-                                    {
-                                        var eventsStr = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "";
-                                        var fightData = new FightData
-                                        {
-                                            Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
-                                            StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
-                                            EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
-                                            EventsString = eventsStr
-                                        };
-                                        
-                                        Plugin.Log.Debug($"[LiveLog] Fight {i+1}: name={fightData.Name}, events={eventsStr.Length} chars");
-                                        Plugin.Log.Information($"[LiveLog] Uploading: {fightData.Name} (segment {i + 1})");
-                                        await onFightComplete(masterStr, fightData, i + 1, globalStartTime, globalEndTime);
-                                    }
-                                    i++;
-                                }
-                                
-                                lastFightCount = currentCount;
-                            }
-                            else
-                            {
-                                Plugin.Log.Warning("[LiveLog] Could not get master data");
-                            }
-                        }
-                    }
+                    lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete);
                 }
                 
                 // Small delay between iterations
@@ -783,6 +741,97 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         }
         
         Plugin.Log.Information("[LiveLog] Stopped");
+        
+        // Final check: Upload any remaining fights
+        if (parserProcess != null)
+        {
+            Plugin.Log.Information("[LiveLog] Final check for remaining fights...");
+            try
+            {
+                // Force a check with a short timeout AND push any pending fight
+                await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: true);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Error(ex, "[LiveLog] Error in final check");
+            }
+        }
+    }
+        finally
+        {
+             StopParser(); // Auto-close Node process after live log session ends
+        }
+    }
+
+    private async Task<int> CheckForFightsAsync(int lastFightCount, Func<string, FightData, int, long, long, Task> onFightComplete, bool pushFightIfNeeded = false)
+    {
+        // Collect fights
+        await SendMessageAsync(new
+        {
+            message = "collect-fights",
+            id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            pushFightIfNeeded = pushFightIfNeeded,
+            scanningOnly = false
+        });
+        
+        // Use a shorter timeout since we might be closing
+        var fightsResult = await WaitForKeyAsync("fights", 5000);
+        
+        if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
+        {
+            var currentCount = fightsArray.GetArrayLength();
+            
+            if (currentCount > lastFightCount)
+            {
+                var newCount = currentCount - lastFightCount;
+                Plugin.Log.Information($"[LiveLog] {newCount} NEW fight(s) detected!");
+                
+                // Get master data
+                await SendMessageAsync(new
+                {
+                    message = "collect-master-info",
+                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                });
+                
+                var masterResult = await WaitForKeyAsync("actorsString", 5000);
+                
+                if (masterResult.HasValue)
+                {
+                    // Get global timestamps from fights result
+                    var fr = fightsResult.Value;
+                    long globalStartTime = fr.TryGetProperty("startTime", out var gst) ? gst.GetInt64() : 0;
+                    long globalEndTime = fr.TryGetProperty("endTime", out var get) ? get.GetInt64() : globalStartTime;
+                    
+                    // Build master string
+                    var masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
+                    
+                    // Upload only NEW fights
+                    int i = 0;
+                    foreach (var fight in fightsArray.EnumerateArray())
+                    {
+                        if (i >= lastFightCount)
+                        {
+                            var eventsStr = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "";
+                            var fightData = new FightData
+                            {
+                                Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
+                                StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
+                                EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
+                                EventsString = eventsStr
+                            };
+                            
+                            Plugin.Log.Information($"[LiveLog] Uploading: {fightData.Name} (segment {i + 1})");
+                            await onFightComplete(masterStr, fightData, i + 1, globalStartTime, globalEndTime);
+                        }
+                        i++;
+                    }
+                    
+                    return currentCount;
+                }
+            }
+            return currentCount > lastFightCount ? currentCount : lastFightCount;
+        }
+        return lastFightCount;
     }
 
     /// <summary>

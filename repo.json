@@ -1,11 +1,11 @@
 [
   {
-    "Author": "claude ai",
+    "Author": "Robert5204",
     "Name": "FFLogs Uploader",
     "InternalName": "FFLogsPlugin",
-    "AssemblyVersion": "1.0.0.0",
-    "DownloadLinkInstall": "https://github.com/Robert5204/FFLogsUploader/releases/download/v1.0.0/latest.zip",
-    "DownloadLinkUpdate": "https://github.com/Robert5204/FFLogsUploader/releases/download/v1.0.0/latest.zip",
+    "AssemblyVersion": "1.0.2.0",
+    "DownloadLinkInstall": "https://github.com/Robert5204/FFLogsUploader/releases/download/v1.0.2/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/Robert5204/FFLogsUploader/releases/download/v1.0.2/latest.zip",
     "Description": "A plugin that allows you to upload ACT combat logs to FFLogs without leaving the game. Supports both live logging and manual log uploads.",
     "ApplicableVersion": "any",
     "RepoUrl": "https://github.com/Robert5204/FFLogsUploader",
@@ -16,6 +16,6 @@
       "logging"
     ],
     "DalamudApiLevel": 14,
-    "Punchline": "Upload combat logs to FFLogs directly from the game",
+    "Punchline": "Upload combat logs to FFLogs directly from the game"
   }
 ]

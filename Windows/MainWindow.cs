@@ -360,9 +360,12 @@ public class MainWindow : Window, IDisposable
         ImGui.Combo("##guild", ref selectedGuildIndex, guildNames, guildNames.Length);
         ImGui.SameLine();
 
-        ImGui.SetNextItemWidth(60);
-        ImGui.Combo("##region", ref selectedRegion, regions, regions.Length);
-        ImGui.SameLine();
+        if (selectedGuildIndex == 0)
+        {
+            ImGui.SetNextItemWidth(60);
+            ImGui.Combo("##region", ref selectedRegion, regions, regions.Length);
+            ImGui.SameLine();
+        }
 
         ImGui.SetNextItemWidth(80);
         ImGui.Combo("##visibility", ref selectedVisibility, visibilities, visibilities.Length);
