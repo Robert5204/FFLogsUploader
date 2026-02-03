@@ -202,9 +202,23 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             parserProcess = null;
         }
 
+        // Check for bundled node.exe in plugin directory first
+        var pluginDir = Plugin.PluginInterface.AssemblyLocation.Directory?.FullName;
+        var bundledNode = pluginDir != null ? Path.Combine(pluginDir, "node.exe") : null;
+        var nodeExecutable = (bundledNode != null && File.Exists(bundledNode)) ? bundledNode : "node";
+        
+        if (bundledNode != null && File.Exists(bundledNode))
+        {
+            Plugin.Log.Information($"Using bundled Node.js: {bundledNode}");
+        }
+        else
+        {
+            Plugin.Log.Information("Using system Node.js");
+        }
+
         var startInfo = new ProcessStartInfo
         {
-            FileName = "node",
+            FileName = nodeExecutable,
             Arguments = $"\"{parserBundlePath}\"",
             UseShellExecute = false,
             RedirectStandardInput = true,
@@ -345,6 +359,24 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
     }
 
     /// <summary>
+    /// Read all lines from a file while allowing other processes (like ACT) to continue writing.
+    /// </summary>
+    private async Task<string[]> ReadLinesWithSharingAsync(string path)
+    {
+        var lines = new List<string>();
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var reader = new StreamReader(fs);
+        
+        string? line;
+        while ((line = await reader.ReadLineAsync()) != null)
+        {
+            lines.Add(line);
+        }
+        
+        return lines.ToArray();
+    }
+
+    /// <summary>
     /// Process a log file using the Node.js parser.
     /// </summary>
     public async Task<(string masterData, List<FightData> fights, long startTime, long endTime)> ProcessLogAsync(string logPath, string reportCode, int region)
@@ -353,8 +385,8 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
 
         Plugin.Log.Information($"[Parser] Processing log: {Path.GetFileName(logPath)}");
 
-        // Read log file
-        var lines = await File.ReadAllLinesAsync(logPath);
+        // Read log file with sharing enabled (ACT may have it open)
+        var lines = await ReadLinesWithSharingAsync(logPath);
         Plugin.Log.Debug($"[Parser] Read {lines.Length} lines");
 
         // Set report code
@@ -548,18 +580,37 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
     /// </summary>
     public async Task StartLiveLogAsync(
         string logDirectory,
-        string reportCode,
         int region,
+        bool uploadPreviousFights,
         Func<string, FightData, int, long, long, Task> onFightComplete,  // Added startTime, endTime
         CancellationToken cancellationToken = default)
     {
         await StartParserProcessAsync();
         
-        // Set report code
-        await SendMessageAsync(new { message = "set-report-code", id = 0, reportCode });
+        // Note: Report code is no longer needed here - it's set when uploading
+
+        // Handle case where logDirectory might actually be a file path
+        var actualDirectory = logDirectory;
+        if (File.Exists(logDirectory))
+        {
+            actualDirectory = Path.GetDirectoryName(logDirectory) ?? logDirectory;
+        }
+        else if (!Directory.Exists(logDirectory))
+        {
+            // Maybe it's a path to a deleted file - extract directory
+            var parentDir = Path.GetDirectoryName(logDirectory);
+            if (!string.IsNullOrEmpty(parentDir) && Directory.Exists(parentDir))
+            {
+                actualDirectory = parentDir;
+            }
+            else
+            {
+                throw new Exception($"Log directory not found: {logDirectory}");
+            }
+        }
 
         // Find the latest log file
-        var files = Directory.GetFiles(logDirectory, "*.log");
+        var files = Directory.GetFiles(actualDirectory, "*.log");
         if (files.Length == 0)
             throw new Exception("No log files found in directory");
         
@@ -570,8 +621,17 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         
         int lastFightCount = 0;
         DateTime lastActivityTime = DateTime.UtcNow;
+        DateTime lastFileCheckTime = DateTime.UtcNow;
         bool checkPending = false;
         long lastPosition = 0;
+
+        // If not uploading previous fights, skip to end of file
+        if (!uploadPreviousFights)
+        {
+            var fileInfo = new FileInfo(logPath);
+            lastPosition = fileInfo.Length;
+            Plugin.Log.Information($"[LiveLog] Skipping to end of file (position {lastPosition})");
+        }
 
         // Main loop
         while (!cancellationToken.IsCancellationRequested)
@@ -602,6 +662,23 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                     // Drain any responses without blocking
                     await Task.Delay(100, cancellationToken);
                     lock (queueLock) ipcQueue.Clear();
+                }
+
+                // Check for a newer log file every 60 seconds (for multi-day sessions)
+                if ((DateTime.UtcNow - lastFileCheckTime).TotalSeconds > 60)
+                {
+                    lastFileCheckTime = DateTime.UtcNow;
+                    var currentFiles = Directory.GetFiles(logDirectory, "*.log");
+                    if (currentFiles.Length > 0)
+                    {
+                        var newestFile = currentFiles.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
+                        if (newestFile != logPath)
+                        {
+                            Plugin.Log.Information($"[LiveLog] Detected newer log file: {Path.GetFileName(newestFile)}");
+                            logPath = newestFile;
+                            lastPosition = 0; // Start from beginning of new file
+                        }
+                    }
                 }
                 
                 // Check if idle for 5+ seconds
@@ -635,8 +712,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                             await SendMessageAsync(new
                             {
                                 message = "collect-master-info",
-                                id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                                reportCode
+                                id = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
                             });
                             
                             var masterResult = await WaitForKeyAsync("actorsString", 5000);

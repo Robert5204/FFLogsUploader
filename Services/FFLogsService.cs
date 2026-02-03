@@ -261,7 +261,7 @@ public class FFLogsService
         return reportCode;
     }
 
-    public async Task StartLiveLogAsync(string logDirectory, int region, int visibility, string? guildId, string description)
+    public async Task StartLiveLogAsync(string logDirectory, int region, int visibility, string? guildId, string description, bool uploadPreviousFights = true)
     {
         if (IsLiveLogging)
         {
@@ -269,21 +269,29 @@ public class FFLogsService
             return;
         }
 
-        // 1. Create report
-        var reportCode = await CreateReportAsync("live_log", description, visibility, region, guildId);
-        
-        // 2. Setup cancellation
+        // Setup cancellation (don't create report yet - wait for first fight)
         liveLogCts = new CancellationTokenSource();
         IsLiveLogging = true;
         LiveFightCount = 0;
+        CurrentReportCode = null; // Reset
 
-        // 3. Start live monitoring (runs in background)
+        // Start live monitoring (runs in background)
         _ = Task.Run(async () =>
         {
+            string? reportCode = null;
+            
             try
             {
-                await plugin.ParserService.StartLiveLogAsync(logDirectory, reportCode, region, async (masterData, fight, segmentId, startTime, endTime) =>
+                await plugin.ParserService.StartLiveLogAsync(logDirectory, region, uploadPreviousFights, async (masterData, fight, segmentId, startTime, endTime) =>
                 {
+                    // Create report lazily on first fight
+                    if (reportCode == null)
+                    {
+                        Plugin.Log.Information("[LiveLog] First fight detected - creating report...");
+                        reportCode = await CreateReportAsync("live_log", description, visibility, region, guildId);
+                        CurrentReportCode = reportCode;
+                    }
+                    
                     await UploadMasterTableAsync(reportCode, masterData);
                     await UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true);
                     LiveFightCount = segmentId;
@@ -299,15 +307,22 @@ public class FFLogsService
             }
             finally
             {
-                // Terminate the report
-                try
+                // Terminate the report only if one was created
+                if (reportCode != null)
                 {
-                    await TerminateReportAsync(reportCode);
+                    try
+                    {
+                        await TerminateReportAsync(reportCode);
+                    }
+                    catch { }
+                    Plugin.Log.Information($"[LiveLog] Live logging ended. Report: {reportCode}");
                 }
-                catch { }
+                else
+                {
+                    Plugin.Log.Information("[LiveLog] Live logging ended. No fights were uploaded.");
+                }
                 
                 IsLiveLogging = false;
-                Plugin.Log.Information($"[LiveLog] Live logging ended. Report: {reportCode}");
             }
         });
     }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.ImGuiFileDialog;
@@ -19,7 +20,7 @@ public class MainWindow : Window, IDisposable
     private int selectedRegion = 0;
     private int selectedVisibility = 1;
     private string description = string.Empty;
-    private bool includeEntireFile = true;
+    private bool uploadPreviousFights = true;
 
     private string statusMessage = string.Empty;
     private bool isProcessing = false;
@@ -39,8 +40,128 @@ public class MainWindow : Window, IDisposable
         };
 
         logPath = plugin.Configuration.LogDirectory;
+        
+        // Auto-detect if empty OR if saved path is invalid
+        if (string.IsNullOrEmpty(logPath) || !IsValidLogPath(logPath))
+        {
+            logPath = AutoDetectLogDirectory();
+            // If we found one, save it immediately so it persists
+            if (!string.IsNullOrEmpty(logPath))
+            {
+                plugin.Configuration.LogDirectory = logPath;
+                plugin.Configuration.Save();
+            }
+        }
+
+        // Auto-populate with the latest log file for easier manual upload
+        if (!string.IsNullOrEmpty(logPath) && System.IO.Directory.Exists(logPath))
+        {
+            var latestFile = GetLatestLogFileFromPath(logPath);
+            if (latestFile != logPath)
+            {
+                logPath = latestFile;
+            }
+        }
+
         selectedRegion = Math.Max(0, plugin.Configuration.Region - 1);
         selectedVisibility = plugin.Configuration.Visibility;
+    }
+
+    private string AutoDetectLogDirectory()
+    {
+        // 1. Check standard FFXIV Plugin path: %APPDATA%\Advanced Combat Tracker\FFXIVLogs
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var actLogs = System.IO.Path.Combine(appData, "Advanced Combat Tracker", "FFXIVLogs");
+        
+        if (System.IO.Directory.Exists(actLogs))
+        {
+            return actLogs;
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Check if a path is valid for FFXIV log files.
+    /// Must be the FFXIVLogs directory or a file inside it.
+    /// </summary>
+    private bool IsValidLogPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return false;
+
+        // Get the directory to check
+        var directoryToCheck = path;
+        if (System.IO.File.Exists(path))
+        {
+            directoryToCheck = System.IO.Path.GetDirectoryName(path) ?? path;
+        }
+
+        // Must be the FFXIVLogs directory specifically (not just any directory with .log files)
+        if (!directoryToCheck.EndsWith("FFXIVLogs", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // Directory must exist and contain .log files
+        if (System.IO.Directory.Exists(directoryToCheck))
+        {
+            try
+            {
+                var logFiles = System.IO.Directory.GetFiles(directoryToCheck, "*.log");
+                return logFiles.Length > 0;
+            }
+            catch { }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// If the path is a file, returns its parent directory. Otherwise returns the path as-is.
+    /// </summary>
+    private string GetDirectoryFromPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return path;
+
+        if (System.IO.File.Exists(path))
+            return System.IO.Path.GetDirectoryName(path) ?? path;
+
+        return path;
+    }
+
+    /// <summary>
+    /// If the path is a directory, returns the most recently modified .log file in it.
+    /// If already a file, returns the path as-is.
+    /// </summary>
+    private string GetLatestLogFileFromPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return path;
+
+        // If it's already a file, use it
+        if (System.IO.File.Exists(path))
+            return path;
+
+        // If it's a directory, find the latest .log file
+        if (System.IO.Directory.Exists(path))
+        {
+            try
+            {
+                var files = System.IO.Directory.GetFiles(path, "*.log");
+                if (files.Length > 0)
+                {
+                    // Sort by last write time descending and take the first
+                    var latest = files
+                        .Select(f => new System.IO.FileInfo(f))
+                        .OrderByDescending(fi => fi.LastWriteTime)
+                        .First();
+                    return latest.FullName;
+                }
+            }
+            catch { }
+        }
+
+        return path;
     }
 
     public void Dispose() { }
@@ -141,7 +262,7 @@ public class MainWindow : Window, IDisposable
         DrawSharedOptions();
         ImGui.Spacing();
 
-        ImGui.Checkbox("Include the Entire File in the Report", ref includeEntireFile);
+        ImGui.Checkbox("Include the Entire File in the Report", ref uploadPreviousFights);
         
         if (plugin.FFLogsService.IsLiveLogging)
             ImGui.EndDisabled();
@@ -292,6 +413,13 @@ public class MainWindow : Window, IDisposable
             return;
         }
 
+        // If the user selected a file, use its parent directory for live logging
+        var effectivePath = GetDirectoryFromPath(logPath);
+        if (effectivePath != logPath)
+        {
+            logPath = effectivePath; // Update the UI field too
+        }
+
         SaveConfig();
         statusMessage = ""; // Clear status - UI will show live logging status instead
         _ = DoLiveLog();
@@ -302,7 +430,7 @@ public class MainWindow : Window, IDisposable
         try
         {
             var guildId = GetSelectedGuildId();
-            await plugin.FFLogsService.StartLiveLogAsync(logPath, selectedRegion + 1, selectedVisibility, guildId, description);
+            await plugin.FFLogsService.StartLiveLogAsync(logPath, selectedRegion + 1, selectedVisibility, guildId, description, uploadPreviousFights);
             // Don't set status - background task is now running
         }
         catch (Exception ex)
@@ -317,6 +445,19 @@ public class MainWindow : Window, IDisposable
         if (string.IsNullOrWhiteSpace(logPath))
         {
             statusMessage = "Please select a log file first.";
+            return;
+        }
+
+        // If the user specified a directory, auto-select the latest log file
+        var effectivePath = GetLatestLogFileFromPath(logPath);
+        if (effectivePath != logPath)
+        {
+            logPath = effectivePath; // Update the UI field too
+        }
+
+        if (!System.IO.File.Exists(logPath))
+        {
+            statusMessage = "No log files found in the specified directory.";
             return;
         }
 
@@ -347,7 +488,14 @@ public class MainWindow : Window, IDisposable
 
     private void SaveConfig()
     {
-        plugin.Configuration.LogDirectory = System.IO.Path.GetDirectoryName(logPath) ?? logPath;
+        // Only extract directory if logPath is a file; if it's already a directory, use it as-is
+        var directoryToSave = logPath;
+        if (System.IO.File.Exists(logPath))
+        {
+            directoryToSave = System.IO.Path.GetDirectoryName(logPath) ?? logPath;
+        }
+        
+        plugin.Configuration.LogDirectory = directoryToSave;
         plugin.Configuration.Region = selectedRegion + 1;
         plugin.Configuration.Visibility = selectedVisibility;
         plugin.Configuration.Save();
