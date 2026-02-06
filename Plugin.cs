@@ -49,6 +49,20 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
 
         Log.Information("FFLogs Plugin loaded!");
+        
+        // Attempt auto-login if credentials are saved
+        _ = CheckAutoLoginAsync();
+    }
+
+    private async System.Threading.Tasks.Task CheckAutoLoginAsync()
+    {
+        if (Configuration.RememberCredentials && 
+            !string.IsNullOrEmpty(Configuration.Email) && 
+            !string.IsNullOrEmpty(Configuration.Password))
+        {
+             Log.Information("Auto-login: Credentials found, attempting login...");
+             await FFLogsService.LoginAsync(Configuration.Email, Configuration.Password);
+        }
     }
 
     public void Dispose()
