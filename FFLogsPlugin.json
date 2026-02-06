@@ -14,7 +14,7 @@
         "utility"
     ],
     "InternalName": "FFLogsPlugin",
-    "AssemblyVersion": "1.0.2.0",
+    "AssemblyVersion": "1.0.3.0",
     "RepoUrl": "https://github.com/Robert5204/FFLogsPlugin",
     "IconUrl": "",
     "DalamudApiLevel": 14
