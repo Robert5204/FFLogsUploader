@@ -24,6 +24,7 @@ public class ParserService : IDisposable
     private Process? parserProcess;
     private readonly Queue<JsonElement> ipcQueue = new();
     private readonly object queueLock = new();
+    private static int sendCounter = 0;
 
     // Use the authenticated HttpClient from FFLogsService
     private HttpClient HttpClient => plugin.FFLogsService.HttpClient;
@@ -288,10 +289,14 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
 
     private async Task SendMessageAsync(object message)
     {
+        if (parserProcess == null || parserProcess.HasExited)
+            throw new InvalidOperationException("Parser process is not running");
+        
+        var seq = Interlocked.Increment(ref sendCounter);
         var json = JsonSerializer.Serialize(message);
-        await parserProcess!.StandardInput.WriteLineAsync(json);
+        await parserProcess.StandardInput.WriteLineAsync(json);
         await parserProcess.StandardInput.FlushAsync();
-        Plugin.Log.Debug($"[Parser] Sent: {json.Substring(0, Math.Min(200, json.Length))}...");
+        Plugin.Log.Debug($"[Parser] Sent #{seq}: {json.Substring(0, Math.Min(200, json.Length))}...");
     }
 
     private async Task<JsonElement?> WaitForChannelAsync(string channel, int timeoutMs = 10000)
@@ -639,16 +644,56 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         int lastFightCount = 0;
         DateTime lastActivityTime = DateTime.UtcNow;
         DateTime lastFileCheckTime = DateTime.UtcNow;
+        DateTime lastFightCheckTime = DateTime.UtcNow;
         bool checkPending = false;
         long lastPosition = 0;
         bool firstPass = true;
+        bool fightEndDetected = false;
+        DateTime fightEndDetectedTime = DateTime.MinValue;
 
-        // If not uploading previous fights, skip to end of file
-        if (!uploadPreviousFights)
+        // Always parse existing file content so the parser has context
+        // (zone info, player data, etc.) — but only upload old fights if requested
         {
-            var fileInfo = new FileInfo(logPath);
-            lastPosition = fileInfo.Length;
-            Plugin.Log.Information($"[LiveLog] Skipping to end of file (position {lastPosition})");
+            var (existingLines, endPos) = await ReadNewLinesAsync(logPath, 0);
+            lastPosition = endPos;
+            
+            if (existingLines.Count > 0)
+            {
+                Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
+                await SendMessageAsync(new
+                {
+                    message = "parse-lines",
+                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    lines = existingLines,
+                    scanning = false,
+                    selectedRegion = regionStr,
+                    raidsToUpload = Array.Empty<object>()
+                });
+                
+                // Give parser time to process the initial batch
+                await Task.Delay(Math.Max(500, existingLines.Count / 100), cancellationToken);
+            }
+            
+            if (!uploadPreviousFights)
+            {
+                // Count existing fights so we skip them
+                await SendMessageAsync(new
+                {
+                    message = "collect-fights",
+                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    pushFightIfNeeded = true,
+                    scanningOnly = false
+                });
+                
+                var existingFights = await WaitForKeyAsync("fights", 5000);
+                if (existingFights.HasValue && existingFights.Value.TryGetProperty("fights", out var fa))
+                {
+                    lastFightCount = fa.GetArrayLength();
+                    Plugin.Log.Information($"[LiveLog] Skipping {lastFightCount} existing fight(s)");
+                }
+                
+                firstPass = false; // Don't trigger initial upload
+            }
         }
 
         // Main loop
@@ -662,7 +707,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 
                 if (newLines.Count > 0)
                 {
-                    Plugin.Log.Debug($"[LiveLog] Read {newLines.Count} new lines");
+                    Plugin.Log.Debug($"[LiveLog] Read {newLines.Count} new lines (pos={lastPosition})");
                     lastActivityTime = DateTime.UtcNow;
                     checkPending = false;
                     
@@ -689,6 +734,27 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                     }
                     
                     // Note: Don't clear IPC queue here - we need the parser responses later!
+                    
+                    // Scan for precise fight-end markers (Director commands)
+                    // 40000011 = wipe cleanup (entities cleared after wipe)
+                    // 40000002/40000003/40000005 = victory/completion
+                    if (!fightEndDetected)
+                    {
+                        foreach (var line in newLines)
+                        {
+                            if (line.StartsWith("33|") && 
+                                (line.Contains("|40000011|") || 
+                                 line.Contains("|40000002|") || 
+                                 line.Contains("|40000003|") || 
+                                 line.Contains("|40000005|")))
+                            {
+                                Plugin.Log.Information($"[LiveLog] Fight end detected (Director): {line.Substring(0, Math.Min(80, line.Length))}");
+                                fightEndDetected = true;
+                                fightEndDetectedTime = DateTime.UtcNow;
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 // Check for a newer log file every 60 seconds (for multi-day sessions)
@@ -708,22 +774,26 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                     }
                 }
                 
-                // Check if idle for 5+ seconds
-                // Check if idle for 5+ seconds OR if we should force a check (initial read)
-                var idleTime = (DateTime.UtcNow - lastActivityTime).TotalSeconds;
+                // Check for fights when:
+                // 1. Fight end detected via Director command (after 5s delay for parser to finalize)
+                // 2. On first pass with uploadPreviousFights
                 bool forceCheck = firstPass && uploadPreviousFights;
+                bool fightEndCheck = fightEndDetected && (DateTime.UtcNow - fightEndDetectedTime).TotalSeconds >= 5.0;
 
-                if ((idleTime > 5.0 || forceCheck) && !checkPending)
+                if ((forceCheck || fightEndCheck) && !checkPending)
                 {
                     if (forceCheck) firstPass = false;
+                    if (fightEndCheck) fightEndDetected = false;
                     checkPending = true;
+                    
                     if (forceCheck)
                         Plugin.Log.Debug($"[LiveLog] Initial read complete - checking for fights immediately");
                     else
-                        Plugin.Log.Debug($"[LiveLog] Idle for {idleTime:F1}s - checking for new fights");
+                        Plugin.Log.Information($"[LiveLog] Fight end confirmed - pushing completed fight");
                     
-                    // Collect fights
-                    lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete);
+                    // Use pushFightIfNeeded since the parser requires it to return completed fights
+                    lastFightCheckTime = DateTime.UtcNow;
+                    lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: true);
                 }
                 
                 // Small delay between iterations

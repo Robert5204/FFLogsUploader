@@ -294,7 +294,7 @@ public class FFLogsService
                     
                     await UploadMasterTableAsync(reportCode, masterData);
                     await UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true);
-                    LiveFightCount = segmentId;
+                    LiveFightCount++;
                 }, liveLogCts.Token);
             }
             catch (OperationCanceledException)
