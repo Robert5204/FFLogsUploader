@@ -27,7 +27,7 @@ public class LoginWindow : Window, IDisposable
         if (plugin.Configuration.RememberCredentials)
         {
             email = plugin.Configuration.Email;
-            password = plugin.Configuration.Password;
+            password = plugin.Configuration.Password; // Transparently decrypted via DPAPI
             rememberMe = true;
         }
     }
@@ -91,7 +91,7 @@ public class LoginWindow : Window, IDisposable
                 if (rememberMe)
                 {
                     plugin.Configuration.Email = email;
-                    plugin.Configuration.Password = password;
+                    plugin.Configuration.Password = password; // Transparently encrypted via DPAPI
                     plugin.Configuration.RememberCredentials = true;
                 }
                 else

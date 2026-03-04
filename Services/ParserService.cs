@@ -4,11 +4,15 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
+using FFLogsPlugin.Helpers;
+using FFLogsPlugin.Models;
 
 namespace FFLogsPlugin.Services;
 
@@ -18,13 +22,40 @@ namespace FFLogsPlugin.Services;
 public class ParserService : IDisposable
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
-    
+
+    // Configurable timing constants (formerly hardcoded magic numbers)
+    private const int LiveLogPollIntervalMs = 500;
+    private const int FightEndDelayMs = 5000;
+    private const int FileCheckIntervalSeconds = 10;
+
+    // Parser page query parameters — exposed as constants for future configurability
+    private const string ParserMetersEnabled = "false";
+    private const string ParserLiveFightDataEnabled = "false";
+
+    /// <summary>
+    /// Director command codes that indicate a fight has ended.
+    /// These are FFXIV network opcodes from log line type 33 (NetworkDirector).
+    /// </summary>
+    private static readonly HashSet<string> FightEndDirectorCodes = new()
+    {
+        "40000011", // Wipe cleanup — entities cleared after a wipe
+        "40000002", // Victory / duty complete
+        "40000003", // Duty complete (alternative)
+        "40000005", // Duty complete (alternative)
+    };
+
     private readonly Plugin plugin;
     private string? parserBundlePath;
     private Process? parserProcess;
-    private readonly Queue<JsonElement> ipcQueue = new();
-    private readonly object queueLock = new();
-    private static int sendCounter = 0;
+    private int sendCounter = 0; // Instance field, not static — each service instance tracks its own counter
+
+    // Channel-based IPC: messages arrive from the output reader and are consumed by WaitForMessageAsync
+    private Channel<JsonElement>? ipcChannel;
+    // Buffer for messages that didn't match the current wait predicate (put-back)
+    // Capped to prevent unbounded growth during long live-logging sessions with repeated timeouts
+    private const int MaxBufferSize = 500;
+    private readonly List<JsonElement> ipcBuffer = new();
+    private readonly object bufferLock = new();
 
     // Use the authenticated HttpClient from FFLogsService
     private HttpClient HttpClient => plugin.FFLogsService.HttpClient;
@@ -36,6 +67,13 @@ public class ParserService : IDisposable
 
     public void Dispose()
     {
+        StopParser();
+        GC.SuppressFinalize(this);
+    }
+
+    ~ParserService()
+    {
+        // Guarantee cleanup of orphaned Node processes even if Dispose wasn't called
         StopParser();
     }
 
@@ -50,7 +88,7 @@ public class ParserService : IDisposable
     }
 
     /// <summary>
-    /// Ensures the parser bundle is downloaded and cached.
+    /// Ensures the parser bundle is downloaded, validated, and cached.
     /// </summary>
     private async Task EnsureParserAsync()
     {
@@ -61,20 +99,31 @@ public class ParserService : IDisposable
         Directory.CreateDirectory(cacheDir);
         parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_bundle.js");
 
-        // If cached and fresh (< 24 hours), use it
+        // If cached and fresh (< 24 hours), validate and use it
         if (File.Exists(parserBundlePath) && File.GetLastWriteTimeUtc(parserBundlePath) > DateTime.UtcNow.AddHours(-24))
         {
-            Plugin.Log.Information($"Using cached parser: {parserBundlePath}");
-            return;
+            // Validate cached bundle isn't corrupted (e.g. disk full during previous write)
+            var cachedSize = new FileInfo(parserBundlePath).Length;
+            if (cachedSize > 10000)
+            {
+                Plugin.Log.Information($"Using cached parser: {parserBundlePath}");
+                return;
+            }
+
+            Plugin.Log.Warning($"Cached parser bundle appears invalid (size={cachedSize}), re-downloading...");
+            File.Delete(parserBundlePath);
         }
 
         Plugin.Log.Information("Downloading FFLogs parser...");
+        
+        // Download to a temp file first so we don't cache partial/invalid downloads
+        var tempPath = parserBundlePath + ".tmp";
         
         try
         {
             // Fetch the parser page
             var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&metersEnabled=false&liveFightDataEnabled=false";
+            var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
             
             var html = await HttpClient.GetStringAsync(parserPageUrl);
             
@@ -92,8 +141,20 @@ public class ParserService : IDisposable
             var parserCode = await HttpClient.GetStringAsync(parserUrl);
             
             // Extract inline glue code
-            var glueMatch = Regex.Match(html, @"<script type=""text/javascript"">([\s\S]*?ipcCollectFights[\s\S]*?)</script>");
-            var glueCode = glueMatch.Success ? glueMatch.Groups[1].Value : "";
+            // Find all inline <script type="text/javascript"> blocks,
+            // then pick the one that contains the ipcCollectFights function.
+            // Using per-block matching avoids crossing </script>...<script> boundaries
+            // which would embed raw HTML tags into the JS bundle.
+            var scriptBlocks = Regex.Matches(html, @"<script type=""text/javascript"">([\s\S]*?)</script>");
+            var glueCode = "";
+            foreach (Match m in scriptBlocks)
+            {
+                if (m.Groups[1].Value.Contains("ipcCollectFights"))
+                {
+                    glueCode = m.Groups[1].Value;
+                    break;
+                }
+            }
             
             // Create runner wrapper
             var runnerCode = @"
@@ -173,11 +234,34 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             // Bundle everything
             var fullBundle = runnerCode + "\n\n" + parserCode + "\n\n" + glueCode;
             
-            await File.WriteAllTextAsync(parserBundlePath, fullBundle);
+            // Validate that the bundle looks like valid parser JS
+            if (fullBundle.Length < 10000 || !fullBundle.Contains("ipcCollectFights"))
+            {
+                throw new Exception($"Downloaded parser bundle appears invalid (size={fullBundle.Length}, missing expected markers). " +
+                                    "This may be a partial download or a Cloudflare error page.");
+            }
+
+            // Detect HTML contamination — raw script/HTML tags should never appear in valid JS
+            if (fullBundle.Contains("<script") || fullBundle.Contains("</script>"))
+            {
+                throw new Exception("Parser bundle contains raw HTML tags — " +
+                    "the FFLogs parser page structure may have changed. " +
+                    "Please report this issue.");
+            }
+            
+            // Write to temp file, then rename — atomic-ish to avoid caching partial downloads
+            await File.WriteAllTextAsync(tempPath, fullBundle);
+            
+            if (File.Exists(parserBundlePath))
+                File.Delete(parserBundlePath);
+            File.Move(tempPath, parserBundlePath);
+            
             Plugin.Log.Information($"Parser downloaded and cached ({fullBundle.Length} bytes)");
         }
         catch (Exception ex)
         {
+            // Clean up temp file on failure
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
             Plugin.Log.Error(ex, "Failed to download parser");
             throw new Exception($"Failed to download parser: {ex.Message}");
         }
@@ -187,7 +271,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
     {
         await EnsureParserAsync();
 
-        // Kill any existing process to start fresh (prevents state accumulation)
+        // Kill any existing process to start fresh
         if (parserProcess != null)
         {
             try
@@ -231,7 +315,13 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
 
         parserProcess = new Process { StartInfo = startInfo };
         
-        lock (queueLock) ipcQueue.Clear();
+        // Create a fresh channel for this process
+        ipcChannel = Channel.CreateUnbounded<JsonElement>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
+        lock (bufferLock) ipcBuffer.Clear();
 
         parserProcess.OutputDataReceived += (sender, args) =>
         {
@@ -242,10 +332,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 {
                     var json = args.Data.Substring(8);
                     var doc = JsonDocument.Parse(json);
-                    lock (queueLock)
-                    {
-                        ipcQueue.Enqueue(doc.RootElement.Clone());
-                    }
+                    ipcChannel?.Writer.TryWrite(doc.RootElement.Clone());
                 }
                 catch (Exception ex)
                 {
@@ -269,22 +356,14 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         parserProcess.BeginErrorReadLine();
 
         // Wait for ready signal
-        var timeout = DateTime.UtcNow.AddSeconds(10);
-        while (DateTime.UtcNow < timeout)
-        {
-            lock (queueLock)
-            {
-                if (ipcQueue.Any(e => e.TryGetProperty("channel", out var c) && c.GetString() == "ready"))
-                {
-                    Plugin.Log.Information("Parser process ready");
-                    ipcQueue.Clear();
-                    return;
-                }
-            }
-            await Task.Delay(100);
-        }
+        var readyMsg = await WaitForMessageAsync(
+            e => e.TryGetProperty("channel", out var c) && c.GetString() == "ready",
+            timeoutMs: 10000);
 
-        throw new Exception("Parser process did not start in time");
+        if (readyMsg == null)
+            throw new Exception("Parser process did not start in time");
+
+        Plugin.Log.Information("Parser process ready");
     }
 
     private async Task SendMessageAsync(object message)
@@ -299,86 +378,105 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         Plugin.Log.Debug($"[Parser] Sent #{seq}: {json.Substring(0, Math.Min(200, json.Length))}...");
     }
 
-    private async Task<JsonElement?> WaitForChannelAsync(string channel, int timeoutMs = 10000)
+    /// <summary>
+    /// Unified message waiting method. Reads from the IPC channel until a message
+    /// matching the predicate is found, or the timeout expires.
+    /// Non-matching messages are buffered for future waits.
+    /// Optionally transforms the matched message before returning.
+    /// </summary>
+    private async Task<JsonElement?> WaitForMessageAsync(
+        Func<JsonElement, bool> predicate,
+        Func<JsonElement, JsonElement>? transform = null,
+        int timeoutMs = 10000,
+        CancellationToken ct = default)
     {
-        var timeout = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-        while (DateTime.UtcNow < timeout)
+        if (ipcChannel == null) return null;
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeoutMs);
+
+        // First check the buffer for an already-received matching message
+        lock (bufferLock)
         {
-            lock (queueLock)
+            for (int i = 0; i < ipcBuffer.Count; i++)
             {
-                for (int i = 0; i < ipcQueue.Count; i++)
+                if (predicate(ipcBuffer[i]))
                 {
-                    var item = ipcQueue.ElementAt(i);
-                    if (item.TryGetProperty("channel", out var c) && c.GetString() == channel)
+                    var match = ipcBuffer[i];
+                    ipcBuffer.RemoveAt(i);
+                    return transform != null ? transform(match) : match;
+                }
+            }
+        }
+
+        // Read from the channel until we find a match or timeout
+        try
+        {
+            while (await ipcChannel.Reader.WaitToReadAsync(timeoutCts.Token))
+            {
+                while (ipcChannel.Reader.TryRead(out var item))
+                {
+                    if (predicate(item))
                     {
-                        // Remove from queue
-                        var temp = ipcQueue.ToList();
-                        temp.RemoveAt(i);
-                        ipcQueue.Clear();
-                        foreach (var t in temp) ipcQueue.Enqueue(t);
-                        return item;
+                        return transform != null ? transform(item) : item;
+                    }
+                    
+                    // Not a match — buffer it for future waits (with cap to prevent unbounded growth)
+                    lock (bufferLock)
+                    {
+                        if (ipcBuffer.Count >= MaxBufferSize)
+                        {
+                            ipcBuffer.RemoveAt(0); // Evict oldest
+                        }
+                        ipcBuffer.Add(item);
                     }
                 }
             }
-            await Task.Delay(50);
         }
+        catch (OperationCanceledException) { }
+
         return null;
     }
 
     /// <summary>
-    /// Wait for a message that contains a specific key (like Python does)
+    /// Wait for a message on a specific IPC channel name (e.g. "ready").
     /// </summary>
-    private async Task<JsonElement?> WaitForKeyAsync(string key, int timeoutMs = 10000)
+    private Task<JsonElement?> WaitForChannelAsync(string channel, int timeoutMs = 10000, CancellationToken ct = default)
     {
-        var timeout = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-        while (DateTime.UtcNow < timeout)
-        {
-            lock (queueLock)
-            {
-                for (int i = 0; i < ipcQueue.Count; i++)
-                {
-                    var item = ipcQueue.ElementAt(i);
-                    // Check in data property (if wrapped by sendToHost)
-                    if (item.TryGetProperty("data", out var dataObj) && dataObj.TryGetProperty(key, out _))
-                    {
-                        var temp = ipcQueue.ToList();
-                        temp.RemoveAt(i);
-                        ipcQueue.Clear();
-                        foreach (var t in temp) ipcQueue.Enqueue(t);
-                        return dataObj;
-                    }
-                    // Check directly (if from event.source.postMessage)
-                    if (item.TryGetProperty(key, out _))
-                    {
-                        var temp = ipcQueue.ToList();
-                        temp.RemoveAt(i);
-                        ipcQueue.Clear();
-                        foreach (var t in temp) ipcQueue.Enqueue(t);
-                        return item;
-                    }
-                }
-            }
-            await Task.Delay(50);
-        }
-        return null;
+        return WaitForMessageAsync(
+            e => e.TryGetProperty("channel", out var c) && c.GetString() == channel,
+            timeoutMs: timeoutMs,
+            ct: ct);
     }
 
     /// <summary>
-    /// Read all lines from a file while allowing other processes (like ACT) to continue writing.
+    /// Wait for a message containing a specific key in its data payload.
+    /// Checks both wrapped format (data.key) and direct format (key).
+    /// Returns the unwrapped data element containing the key.
     /// </summary>
-    private async Task<string[]> ReadLinesWithSharingAsync(string path)
+    private Task<JsonElement?> WaitForKeyAsync(string key, int timeoutMs = 10000, CancellationToken ct = default)
     {
-        var lines = new List<string>();
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var reader = new StreamReader(fs);
-        
-        string? line;
-        while ((line = await reader.ReadLineAsync()) != null)
-        {
-            lines.Add(line);
-        }
-        
-        return lines.ToArray();
+        // Capture the resolved element during predicate evaluation to avoid redundant lookups in the transform
+        JsonElement resolvedElement = default;
+
+        return WaitForMessageAsync(
+            e =>
+            {
+                if (e.TryGetProperty("data", out var d) && d.TryGetProperty(key, out _))
+                {
+                    resolvedElement = d;
+                    return true;
+                }
+                if (e.TryGetProperty(key, out _))
+                {
+                    resolvedElement = e;
+                    return true;
+                }
+                return false;
+            },
+            transform: _ => resolvedElement,
+            timeoutMs: timeoutMs,
+            ct: ct);
     }
 
     /// <summary>
@@ -395,158 +493,126 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
 
         try
         {
+            Plugin.Log.Information($"[Parser] Processing log: {Path.GetFileName(logPath)}");
 
-        Plugin.Log.Information($"[Parser] Processing log: {Path.GetFileName(logPath)}");
+            // Read log file with sharing enabled (ACT may have it open)
+            var lines = await LogFileHelper.ReadAllLinesSharedAsync(logPath);
+            Plugin.Log.Debug($"[Parser] Read {lines.Length} lines");
 
-        // Read log file with sharing enabled (ACT may have it open)
-        var lines = await ReadLinesWithSharingAsync(logPath);
-        Plugin.Log.Debug($"[Parser] Read {lines.Length} lines");
+            var regionStr = ((FFLogsRegion)region).ToCode();
 
-        // Set report code
-        await SendMessageAsync(new { message = "set-report-code", id = 0, reportCode });
-        await Task.Delay(100);
+            // Set report code
+            await SendMessageAsync(new { message = "set-report-code", id = 0, reportCode });
+            await Task.Delay(100);
 
-        // Parse lines
-        var regionMap = new Dictionary<int, string> { {1, "NA"}, {2, "EU"}, {3, "JP"}, {4, "CN"}, {5, "KR"} };
-        var regionStr = regionMap.GetValueOrDefault(region, "NA");
-
-        await SendMessageAsync(new
-        {
-            message = "parse-lines",
-            id = 1,
-            lines = lines,
-            scanning = false,
-            selectedRegion = regionStr,
-            raidsToUpload = Array.Empty<int>()
-        });
-
-        // Wait for parsing to complete (longer for large files)
-        await Task.Delay(Math.Max(500, lines.Length / 100));
-
-        // Collect fights
-        await SendMessageAsync(new
-        {
-            message = "collect-fights",
-            id = 2,
-            pushFightIfNeeded = false,
-            scanningOnly = false
-        });
-
-        // Wait for fights data (look for 'fights' key like Python does)
-        var fightsResult = await WaitForKeyAsync("fights", 15000);
-        
-        // Debug log what we got
-        if (fightsResult.HasValue)
-        {
-            Plugin.Log.Debug($"[Parser] Got fights result with {(fightsResult.Value.TryGetProperty("fights", out var f) ? f.GetArrayLength() : 0)} fights");
-        }
-        else
-        {
-            Plugin.Log.Warning("[Parser] No fights result received!");
-            // Debug: log what's in the queue
-            lock (queueLock)
+            // Parse lines
+            await SendMessageAsync(new
             {
-                Plugin.Log.Debug($"[Parser] Queue has {ipcQueue.Count} messages");
-                foreach (var msg in ipcQueue)
+                message = "parse-lines",
+                id = 1,
+                lines = lines,
+                scanning = false,
+                selectedRegion = regionStr,
+                raidsToUpload = Array.Empty<int>()
+            });
+
+            // Wait for parsing to complete (longer for large files)
+            await Task.Delay(Math.Max(500, lines.Length / 100));
+
+            // Collect fights
+            await SendMessageAsync(new
+            {
+                message = "collect-fights",
+                id = 2,
+                pushFightIfNeeded = false,
+                scanningOnly = false
+            });
+
+            // Wait for fights data
+            var fightsResult = await WaitForKeyAsync("fights", 15000);
+            
+            if (fightsResult.HasValue)
+            {
+                Plugin.Log.Debug($"[Parser] Got fights result with {(fightsResult.Value.TryGetProperty("fights", out var f) ? f.GetArrayLength() : 0)} fights");
+            }
+            else
+            {
+                Plugin.Log.Warning("[Parser] No fights result received!");
+                lock (bufferLock)
                 {
-                    var keys = new List<string>();
-                    foreach (var prop in msg.EnumerateObject())
-                        keys.Add(prop.Name);
-                    Plugin.Log.Debug($"[Parser] Message keys: {string.Join(", ", keys)}");
+                    Plugin.Log.Debug($"[Parser] Buffer has {ipcBuffer.Count} messages");
+                    foreach (var msg in ipcBuffer)
+                    {
+                        var keys = new List<string>();
+                        foreach (var prop in msg.EnumerateObject())
+                            keys.Add(prop.Name);
+                        Plugin.Log.Debug($"[Parser] Message keys: {string.Join(", ", keys)}");
+                    }
                 }
             }
-        }
-        
-        // Collect master info
-        await SendMessageAsync(new
-        {
-            message = "collect-master-info",
-            id = 3,
-            reportCode
-        });
-
-        // Wait for master data (look for 'actorsString' key like Python does)
-        var masterResult = await WaitForKeyAsync("actorsString", 15000);
-
-        // Debug log what we received
-        if (fightsResult.HasValue)
-        {
-            var rawJson = fightsResult.Value.ToString();
-            Plugin.Log.Debug($"[Parser] Fights result (first 500 chars): {rawJson.Substring(0, Math.Min(500, rawJson.Length))}");
-        }
-        else
-        {
-            Plugin.Log.Warning("[Parser] No fights result received!");
-        }
-
-        // Process results - try multiple formats
-        // fights declared outside
-        
-        JsonElement? fightsArray = null;
-        
-        if (fightsResult.HasValue)
-        {
-            var fr = fightsResult.Value;
             
-            // Try data.fights (wrapped format)
-            if (fr.TryGetProperty("data", out var dataObj) && dataObj.TryGetProperty("fights", out var f1))
+            // Collect master info
+            await SendMessageAsync(new
             {
-                fightsArray = f1;
-                Plugin.Log.Debug("[Parser] Found fights in data.fights");
-            }
-            // Try direct fights property
-            else if (fr.TryGetProperty("fights", out var f2))
+                message = "collect-master-info",
+                id = 3,
+                reportCode
+            });
+
+            // Wait for master data
+            var masterResult = await WaitForKeyAsync("actorsString", 15000);
+
+            // Extract fights array — WaitForKeyAsync already unwraps the data envelope,
+            // so fightsResult directly contains the element with "fights" as a property.
+            if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
             {
-                fightsArray = f2;
-                Plugin.Log.Debug("[Parser] Found fights directly");
-            }
-        }
-        
-        if (fightsArray.HasValue)
-        {
-            foreach (var fight in fightsArray.Value.EnumerateArray())
-            {
-                fights.Add(new FightData
+                foreach (var fight in fightsArray.EnumerateArray())
                 {
-                    Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
-                    StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
-                    EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
-                    EventsString = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : ""
-                });
+                    fights.Add(new FightData
+                    {
+                        Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
+                        StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
+                        EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
+                        EventsString = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : ""
+                    });
+                }
+
+                // Global timestamps live on the same unwrapped element
+                var fr = fightsResult.Value;
+                startTime = fr.TryGetProperty("startTime", out var st) ? st.GetInt64() : 0;
+                endTime = fr.TryGetProperty("endTime", out var et) ? et.GetInt64() : 0;
             }
-        }
 
-        Plugin.Log.Information($"[Parser] Extracted {fights.Count} fights");
-
-        // Get global timestamps from fights result
-        // Get global timestamps from fights result
-        // vars startTime, endTime declared outside
-        if (fightsResult.HasValue)
-        {
-            var fr = fightsResult.Value;
-            startTime = fr.TryGetProperty("startTime", out var st) ? st.GetInt64() : 0;
-            endTime = fr.TryGetProperty("endTime", out var et) ? et.GetInt64() : 0;
-        }
-
-        // Build master table string - header comes from fights, sections from master
-        // Build master table string - header comes from fights, sections from master
-        // var masterStr declared outside
-        if (masterResult.HasValue)
-        {
-            // Get header info from fights result (logVersion, gameVersion, logFileDetails)
-            JsonElement? fightsHeader = fightsResult;
-            masterStr = BuildMasterTableString(fightsHeader, masterResult.Value);
-        }
-
+            Plugin.Log.Information($"[Parser] Extracted {fights.Count} fights");
+            if (masterResult.HasValue)
+            {
+                JsonElement? fightsHeader = fightsResult;
+                masterStr = BuildMasterTableString(fightsHeader, masterResult.Value);
+            }
         }
         finally
         {
-            StopParser(); // Auto-close Node process after manual upload
+            StopParser();
         }
 
         return (masterStr, fights, startTime, endTime);
     }
 
+    /// <summary>
+    /// Builds the master table string that FFLogs expects for report uploads.
+    /// 
+    /// Format (proprietary FFLogs format):
+    ///   Line 1: "{logVersion}|{gameVersion}|{logFileDetails}"    — header from fights data
+    ///   Then for each section (in strict order):
+    ///     - Line: count of entries
+    ///     - Lines: the entries themselves
+    /// 
+    /// Section order must match the official FFLogs client:
+    ///   1. actorsString   — combat actors (players, enemies, NPCs) with IDs and names
+    ///   2. abilitiesString — all abilities/spells seen in the log with IDs and names
+    ///   3. tuplesString   — actor-ability tuples linking who used what
+    ///   4. petsString     — pet/companion actors and their owners
+    /// </summary>
     private string BuildMasterTableString(JsonElement? fightsData, JsonElement masterData)
     {
         var parts = new List<string>();
@@ -567,7 +633,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         // Header line
         parts.Add($"{logVersion}|{gameVersion}|{logFileDetails}");
 
-        // Sections in order: actorsString, abilitiesString, tuplesString, petsString (matching Python)
+        // Sections in strict order (must match official FFLogs client — see summary above)
         string[] sectionKeys = { "actorsString", "abilitiesString", "tuplesString", "petsString" };
         
         foreach (var key in sectionKeys)
@@ -578,15 +644,11 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 value = prop.GetString() ?? "";
             }
             
-            // Get lines - don't trim, just filter empty lines
             var lines = value.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                              .Where(l => !string.IsNullOrWhiteSpace(l))
                              .ToList();
             
-            // Add count
             parts.Add(lines.Count.ToString());
-            
-            // Add lines
             parts.AddRange(lines);
         }
 
@@ -596,246 +658,242 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
     }
 
     /// <summary>
-    /// Start live logging - monitors the latest log file and uploads fights as they complete.
+    /// Start live logging — monitors the latest log file and uploads fights as they complete.
     /// </summary>
     public async Task StartLiveLogAsync(
         string logDirectory,
         int region,
         bool uploadPreviousFights,
-        Func<string, FightData, int, long, long, Task> onFightComplete,  // Added startTime, endTime
+        Func<string, FightData, int, long, long, Task> onFightComplete,
         CancellationToken cancellationToken = default)
     {
         await StartParserProcessAsync();
+
         try
         {
-        
-        // Note: Report code is no longer needed here - it's set when uploading
-
-        // Handle case where logDirectory might actually be a file path
-        var actualDirectory = logDirectory;
-        if (File.Exists(logDirectory))
-        {
-            actualDirectory = Path.GetDirectoryName(logDirectory) ?? logDirectory;
-        }
-        else if (!Directory.Exists(logDirectory))
-        {
-            // Maybe it's a path to a deleted file - extract directory
-            var parentDir = Path.GetDirectoryName(logDirectory);
-            if (!string.IsNullOrEmpty(parentDir) && Directory.Exists(parentDir))
+            // Handle case where logDirectory might actually be a file path
+            var actualDirectory = logDirectory;
+            if (File.Exists(logDirectory))
             {
-                actualDirectory = parentDir;
+                actualDirectory = Path.GetDirectoryName(logDirectory) ?? logDirectory;
             }
-            else
+            else if (!Directory.Exists(logDirectory))
             {
-                throw new Exception($"Log directory not found: {logDirectory}");
-            }
-        }
-
-        // Find the latest log file
-        var files = Directory.GetFiles(actualDirectory, "*.log");
-        if (files.Length == 0)
-            throw new Exception("No log files found in directory");
-        
-        var logPath = files.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
-        Plugin.Log.Information($"[LiveLog] Monitoring: {Path.GetFileName(logPath)}");
-
-        var regionStr = region switch { 1 => "NA", 2 => "EU", 3 => "JP", 4 => "OC", _ => "NA" };
-        
-        int lastFightCount = 0;
-        DateTime lastActivityTime = DateTime.UtcNow;
-        DateTime lastFileCheckTime = DateTime.UtcNow;
-        DateTime lastFightCheckTime = DateTime.UtcNow;
-        bool checkPending = false;
-        long lastPosition = 0;
-        bool firstPass = true;
-        bool fightEndDetected = false;
-        DateTime fightEndDetectedTime = DateTime.MinValue;
-
-        // Always parse existing file content so the parser has context
-        // (zone info, player data, etc.) — but only upload old fights if requested
-        {
-            var (existingLines, endPos) = await ReadNewLinesAsync(logPath, 0);
-            lastPosition = endPos;
-            
-            if (existingLines.Count > 0)
-            {
-                Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
-                await SendMessageAsync(new
+                var parentDir = Path.GetDirectoryName(logDirectory);
+                if (!string.IsNullOrEmpty(parentDir) && Directory.Exists(parentDir))
                 {
-                    message = "parse-lines",
-                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    lines = existingLines,
-                    scanning = false,
-                    selectedRegion = regionStr,
-                    raidsToUpload = Array.Empty<object>()
-                });
-                
-                // Give parser time to process the initial batch
-                await Task.Delay(Math.Max(500, existingLines.Count / 100), cancellationToken);
-            }
-            
-            if (!uploadPreviousFights)
-            {
-                // Count existing fights so we skip them
-                await SendMessageAsync(new
-                {
-                    message = "collect-fights",
-                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    pushFightIfNeeded = true,
-                    scanningOnly = false
-                });
-                
-                var existingFights = await WaitForKeyAsync("fights", 5000);
-                if (existingFights.HasValue && existingFights.Value.TryGetProperty("fights", out var fa))
-                {
-                    lastFightCount = fa.GetArrayLength();
-                    Plugin.Log.Information($"[LiveLog] Skipping {lastFightCount} existing fight(s)");
+                    actualDirectory = parentDir;
                 }
-                
-                firstPass = false; // Don't trigger initial upload
-            }
-        }
-
-        // Main loop
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                // Read new lines from log file
-                var (newLines, newPosition) = await ReadNewLinesAsync(logPath, lastPosition);
-                lastPosition = newPosition;
-                
-                if (newLines.Count > 0)
+                else
                 {
-                    Plugin.Log.Debug($"[LiveLog] Read {newLines.Count} new lines (pos={lastPosition})");
-                    lastActivityTime = DateTime.UtcNow;
-                    checkPending = false;
-                    
-                    // Send lines to parser
+                    throw new Exception($"Log directory not found: {logDirectory}");
+                }
+            }
+
+            // Find the latest log file
+            var files = Directory.GetFiles(actualDirectory, "*.log");
+            if (files.Length == 0)
+                throw new Exception("No log files found in directory");
+
+            var logPath = files.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
+            Plugin.Log.Information($"[LiveLog] Monitoring: {Path.GetFileName(logPath)}");
+
+            var regionStr = ((FFLogsRegion)region).ToCode();
+
+            int lastFightCount = 0;
+            DateTime lastActivityTime = DateTime.UtcNow;
+            DateTime lastFileCheckTime = DateTime.UtcNow;
+            bool checkPending = false;
+            long lastPosition = 0;
+            bool firstPass = true;
+            bool fightEndDetected = false;
+            DateTime fightEndDetectedTime = DateTime.MinValue;
+
+            // Always parse existing file content so the parser has context
+            {
+                var (existingLines, endPos) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, 0);
+                lastPosition = endPos;
+
+                if (existingLines.Count > 0)
+                {
+                    Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
                     await SendMessageAsync(new
                     {
                         message = "parse-lines",
                         id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        lines = newLines,
+                        lines = existingLines,
                         scanning = false,
                         selectedRegion = regionStr,
                         raidsToUpload = Array.Empty<object>()
                     });
-                    
-                    // Give parser time to process
-                    // If this is the initial large read, wait longer
-                    if (firstPass && uploadPreviousFights && newLines.Count > 1000)
+
+                    await Task.Delay(Math.Max(500, existingLines.Count / 100), cancellationToken);
+                }
+
+                if (!uploadPreviousFights)
+                {
+                    await SendMessageAsync(new
                     {
-                         await Task.Delay(Math.Max(500, newLines.Count / 100), cancellationToken);
+                        message = "collect-fights",
+                        id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        pushFightIfNeeded = true,
+                        scanningOnly = false
+                    });
+
+                    var existingFights = await WaitForKeyAsync("fights", 5000, cancellationToken);
+                    if (existingFights.HasValue && existingFights.Value.TryGetProperty("fights", out var fa))
+                    {
+                        lastFightCount = fa.GetArrayLength();
+                        Plugin.Log.Information($"[LiveLog] Skipping {lastFightCount} existing fight(s)");
                     }
-                    else
+
+                    firstPass = false;
+                }
+            }
+
+            // Main loop
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    // Read new lines from log file
+                    var (newLines, newPosition) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, lastPosition);
+                    lastPosition = newPosition;
+
+                    if (newLines.Count > 0)
                     {
-                         await Task.Delay(100, cancellationToken);
-                    }
-                    
-                    // Note: Don't clear IPC queue here - we need the parser responses later!
-                    
-                    // Scan for precise fight-end markers (Director commands)
-                    // 40000011 = wipe cleanup (entities cleared after wipe)
-                    // 40000002/40000003/40000005 = victory/completion
-                    if (!fightEndDetected)
-                    {
-                        foreach (var line in newLines)
+                        Plugin.Log.Debug($"[LiveLog] Read {newLines.Count} new lines (pos={lastPosition})");
+                        lastActivityTime = DateTime.UtcNow;
+                        checkPending = false;
+
+                        // Send lines to parser
+                        await SendMessageAsync(new
                         {
-                            if (line.StartsWith("33|") && 
-                                (line.Contains("|40000011|") || 
-                                 line.Contains("|40000002|") || 
-                                 line.Contains("|40000003|") || 
-                                 line.Contains("|40000005|")))
+                            message = "parse-lines",
+                            id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                            lines = newLines,
+                            scanning = false,
+                            selectedRegion = regionStr,
+                            raidsToUpload = Array.Empty<object>()
+                        });
+
+                        if (firstPass && uploadPreviousFights && newLines.Count > 1000)
+                        {
+                            await Task.Delay(Math.Max(500, newLines.Count / 100), cancellationToken);
+                        }
+                        else
+                        {
+                            await Task.Delay(100, cancellationToken);
+                        }
+
+                        // Scan for fight-end Director commands using centralized code set
+                        if (!fightEndDetected)
+                        {
+                            foreach (var line in newLines)
                             {
-                                Plugin.Log.Information($"[LiveLog] Fight end detected (Director): {line.Substring(0, Math.Min(80, line.Length))}");
-                                fightEndDetected = true;
-                                fightEndDetectedTime = DateTime.UtcNow;
-                                break;
+                                if (line.StartsWith("33|") && FightEndDirectorCodes.Any(code => line.Contains($"|{code}|")))
+                                {
+                                    Plugin.Log.Information($"[LiveLog] Fight end detected (Director): {line.Substring(0, Math.Min(80, line.Length))}");
+                                    fightEndDetected = true;
+                                    fightEndDetectedTime = DateTime.UtcNow;
+                                    break;
+                                }
                             }
                         }
                     }
-                }
 
-                // Check for a newer log file every 60 seconds (for multi-day sessions)
-                if ((DateTime.UtcNow - lastFileCheckTime).TotalSeconds > 60)
-                {
-                    lastFileCheckTime = DateTime.UtcNow;
-                    var currentFiles = Directory.GetFiles(logDirectory, "*.log");
-                    if (currentFiles.Length > 0)
+                    // Check for a newer log file periodically
+                    // Reduced from 60s to 10s to minimize gap between old and new file
+                    if ((DateTime.UtcNow - lastFileCheckTime).TotalSeconds > FileCheckIntervalSeconds)
                     {
-                        var newestFile = currentFiles.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
-                        if (newestFile != logPath)
+                        lastFileCheckTime = DateTime.UtcNow;
+                        var currentFiles = Directory.GetFiles(actualDirectory, "*.log");
+                        if (currentFiles.Length > 0)
                         {
-                            Plugin.Log.Information($"[LiveLog] Detected newer log file: {Path.GetFileName(newestFile)}");
-                            logPath = newestFile;
-                            lastPosition = 0; // Start from beginning of new file
+                            var newestFile = currentFiles.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
+                            if (newestFile != logPath)
+                            {
+                                // Finish reading the remainder of the old file before switching
+                                var (remainingLines, _) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, lastPosition);
+                                if (remainingLines.Count > 0)
+                                {
+                                    Plugin.Log.Information($"[LiveLog] Reading {remainingLines.Count} remaining lines from old file before switching");
+                                    await SendMessageAsync(new
+                                    {
+                                        message = "parse-lines",
+                                        id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                                        lines = remainingLines,
+                                        scanning = false,
+                                        selectedRegion = regionStr,
+                                        raidsToUpload = Array.Empty<object>()
+                                    });
+                                    await Task.Delay(100, cancellationToken);
+                                }
+
+                                Plugin.Log.Information($"[LiveLog] Switching to newer log file: {Path.GetFileName(newestFile)}");
+                                logPath = newestFile;
+                                lastPosition = 0;
+                            }
                         }
                     }
-                }
-                
-                // Check for fights when:
-                // 1. Fight end detected via Director command (after 5s delay for parser to finalize)
-                // 2. On first pass with uploadPreviousFights
-                bool forceCheck = firstPass && uploadPreviousFights;
-                bool fightEndCheck = fightEndDetected && (DateTime.UtcNow - fightEndDetectedTime).TotalSeconds >= 5.0;
 
-                if ((forceCheck || fightEndCheck) && !checkPending)
-                {
-                    if (forceCheck) firstPass = false;
-                    if (fightEndCheck) fightEndDetected = false;
-                    checkPending = true;
-                    
-                    if (forceCheck)
-                        Plugin.Log.Debug($"[LiveLog] Initial read complete - checking for fights immediately");
-                    else
-                        Plugin.Log.Information($"[LiveLog] Fight end confirmed - pushing completed fight");
-                    
-                    // Use pushFightIfNeeded since the parser requires it to return completed fights
-                    lastFightCheckTime = DateTime.UtcNow;
-                    lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: true);
+                    // Check for fights when:
+                    // 1. Fight end detected via Director command (after configurable delay for parser to finalize)
+                    // 2. On first pass with uploadPreviousFights
+                    bool forceCheck = firstPass && uploadPreviousFights;
+                    bool fightEndCheck = fightEndDetected && (DateTime.UtcNow - fightEndDetectedTime).TotalMilliseconds >= FightEndDelayMs;
+
+                    if ((forceCheck || fightEndCheck) && !checkPending)
+                    {
+                        if (forceCheck) firstPass = false;
+                        if (fightEndCheck) fightEndDetected = false;
+                        checkPending = true;
+
+                        if (forceCheck)
+                            Plugin.Log.Debug($"[LiveLog] Initial read complete - checking for fights immediately");
+                        else
+                            Plugin.Log.Information($"[LiveLog] Fight end confirmed - pushing completed fight");
+
+                        lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: true);
+                    }
+
+                    await Task.Delay(LiveLogPollIntervalMs, cancellationToken);
                 }
-                
-                // Small delay between iterations
-                await Task.Delay(500, cancellationToken);
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.Error(ex, "[LiveLog] Error in loop");
+                    await Task.Delay(1000, cancellationToken);
+                }
             }
-            catch (OperationCanceledException)
+
+            Plugin.Log.Information("[LiveLog] Stopped");
+
+            // Final check: Upload any remaining fights
+            if (parserProcess != null)
             {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Error(ex, "[LiveLog] Error in loop");
-                await Task.Delay(1000, cancellationToken);
+                Plugin.Log.Information("[LiveLog] Final check for remaining fights...");
+                try
+                {
+                    await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: true);
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.Error(ex, "[LiveLog] Error in final check");
+                }
             }
         }
-        
-        Plugin.Log.Information("[LiveLog] Stopped");
-        
-        // Final check: Upload any remaining fights
-        if (parserProcess != null)
-        {
-            Plugin.Log.Information("[LiveLog] Final check for remaining fights...");
-            try
-            {
-                // Force a check with a short timeout AND push any pending fight
-                await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: true);
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Error(ex, "[LiveLog] Error in final check");
-            }
-        }
-    }
         finally
         {
-             StopParser(); // Auto-close Node process after live log session ends
+            StopParser();
         }
     }
 
     private async Task<int> CheckForFightsAsync(int lastFightCount, Func<string, FightData, int, long, long, Task> onFightComplete, bool pushFightIfNeeded = false)
     {
-        // Collect fights
         await SendMessageAsync(new
         {
             message = "collect-fights",
@@ -844,7 +902,6 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             scanningOnly = false
         });
         
-        // Use a shorter timeout since we might be closing
         var fightsResult = await WaitForKeyAsync("fights", 5000);
         
         if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
@@ -856,7 +913,6 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 var newCount = currentCount - lastFightCount;
                 Plugin.Log.Information($"[LiveLog] {newCount} NEW fight(s) detected!");
                 
-                // Get master data
                 await SendMessageAsync(new
                 {
                     message = "collect-master-info",
@@ -867,15 +923,12 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 
                 if (masterResult.HasValue)
                 {
-                    // Get global timestamps from fights result
                     var fr = fightsResult.Value;
                     long globalStartTime = fr.TryGetProperty("startTime", out var gst) ? gst.GetInt64() : 0;
                     long globalEndTime = fr.TryGetProperty("endTime", out var get) ? get.GetInt64() : globalStartTime;
                     
-                    // Build master string
                     var masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
                     
-                    // Upload only NEW fights
                     int i = 0;
                     foreach (var fight in fightsArray.EnumerateArray())
                     {
@@ -902,45 +955,5 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             return currentCount > lastFightCount ? currentCount : lastFightCount;
         }
         return lastFightCount;
-    }
-
-    /// <summary>
-    /// Read new lines from a log file starting from a position.
-    /// </summary>
-    private async Task<(List<string> lines, long newPosition)> ReadNewLinesAsync(string logPath, long position)
-    {
-        var lines = new List<string>();
-        var newPosition = position;
-        
-        try
-        {
-            using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            
-            // If file was truncated (new log), reset position
-            if (stream.Length < position)
-            {
-                newPosition = 0;
-                Plugin.Log.Debug("[LiveLog] File truncated, resetting position");
-            }
-            
-            stream.Seek(newPosition, SeekOrigin.Begin);
-            
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            string? line;
-            while ((line = await reader.ReadLineAsync()) != null)
-            {
-                var cleanLine = line.Replace("\0", "").Trim();
-                if (!string.IsNullOrEmpty(cleanLine))
-                    lines.Add(cleanLine);
-            }
-            
-            newPosition = stream.Position;
-        }
-        catch (Exception ex)
-        {
-            Plugin.Log.Debug($"[LiveLog] Read error: {ex.Message}");
-        }
-        
-        return (lines, newPosition);
     }
 }

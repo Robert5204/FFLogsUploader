@@ -9,18 +9,20 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
+using FFLogsPlugin.Handlers;
+using FFLogsPlugin.Models;
 
 namespace FFLogsPlugin.Services;
 
 /// <summary>
 /// Handles all FFLogs API communication: login, report creation, uploads.
-/// Ported from the Python fflogs_client_emulator.py
 /// </summary>
 public class FFLogsService
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
     private const string CLIENT_VERSION = "8.19.39";
     private const int PARSER_VERSION = 1072;
+    private const int MaxRetries = 3;
     
     private readonly Plugin plugin;
     private readonly CookieContainer cookies;
@@ -38,30 +40,22 @@ public class FFLogsService
     public int LiveFightCount { get; private set; }
     private CancellationTokenSource? liveLogCts;
 
-    private void UpdateCsrfHeader()
-    {
-        var xsrfCookie = cookies.GetCookies(new Uri(FFLOGS_URL))["XSRF-TOKEN"]?.Value;
-        if (!string.IsNullOrEmpty(xsrfCookie))
-        {
-            var decodedXsrf = HttpUtility.UrlDecode(xsrfCookie);
-            HttpClient.DefaultRequestHeaders.Remove("X-XSRF-TOKEN");
-            HttpClient.DefaultRequestHeaders.Add("X-XSRF-TOKEN", decodedXsrf);
-        }
-    }
-
     public FFLogsService(Plugin plugin)
     {
         this.plugin = plugin;
         
         cookies = new CookieContainer();
-        var handler = new HttpClientHandler
+        var innerHandler = new HttpClientHandler
         {
             CookieContainer = cookies,
             UseCookies = true,
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
         };
         
-        HttpClient = new HttpClient(handler)
+        // Wrap with XSRF handler so every request automatically gets the token
+        var xsrfHandler = new XsrfDelegatingHandler(cookies, new Uri(FFLOGS_URL), innerHandler);
+        
+        HttpClient = new HttpClient(xsrfHandler)
         {
             BaseAddress = new Uri(FFLOGS_URL)
         };
@@ -84,7 +78,6 @@ public class FFLogsService
         {
             Plugin.Log.Information("[Login] Starting login via desktop-client API...");
             
-            // Use the official desktop client API endpoint (avoids CSRF/Cloudflare issues)
             var payload = new Dictionary<string, string>
             {
                 ["email"] = email,
@@ -156,15 +149,7 @@ public class FFLogsService
                 Plugin.Log.Warning("[Login] Token refresh failed, but login may still work");
             }
 
-            // Update XSRF header from cookies
-            var xsrfCookie = cookies.GetCookies(new Uri(FFLOGS_URL))["XSRF-TOKEN"]?.Value;
-            if (!string.IsNullOrEmpty(xsrfCookie))
-            {
-                var decodedXsrf = HttpUtility.UrlDecode(xsrfCookie);
-                HttpClient.DefaultRequestHeaders.Remove("X-XSRF-TOKEN");
-                HttpClient.DefaultRequestHeaders.Add("X-XSRF-TOKEN", decodedXsrf);
-                Plugin.Log.Debug("[Login] XSRF header set");
-            }
+            // XSRF header is now handled automatically by XsrfDelegatingHandler
 
             IsLoggedIn = true;
             Plugin.Log.Information("[Login] Login successful!");
@@ -180,19 +165,13 @@ public class FFLogsService
     public void Logout()
     {
         IsLoggedIn = false;
-        plugin.Configuration.SessionCookie = null;
-        plugin.Configuration.XsrfToken = null;
-        plugin.Configuration.Save();
+        // No session fields to clear — XSRF is managed by the handler
     }
 
     public async Task<string> CreateReportAsync(string filename, string description, int visibility, int region, string? guildId = null)
     {
-        // Update CSRF header before request
-        UpdateCsrfHeader();
-        
         var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         
-        // Use desktop-client endpoint and payload format matching Python emulator
         var payload = new Dictionary<string, object?>
         {
             ["clientVersion"] = CLIENT_VERSION,
@@ -244,14 +223,11 @@ public class FFLogsService
         // 2. Process log with parser
         var (masterData, fights, startTime, endTime) = await plugin.ParserService.ProcessLogAsync(logPath, reportCode, region);
 
-        // 3. Upload each fight segment (with master table before each, like Python does)
+        // 3. Upload each fight segment (with master table before each)
         for (int i = 0; i < fights.Count; i++)
         {
-            // Upload master table before each segment (interleaved)
-            await UploadMasterTableAsync(reportCode, masterData);
-            
-            // Upload segment with global timestamps (not per-fight)
-            await UploadSegmentAsync(reportCode, fights[i], i + 1, startTime, endTime);
+            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData));
+            await WithRetryAsync(() => UploadSegmentAsync(reportCode, fights[i], i + 1, startTime, endTime));
         }
 
         // 4. Terminate the report
@@ -269,13 +245,11 @@ public class FFLogsService
             return;
         }
 
-        // Setup cancellation (don't create report yet - wait for first fight)
         liveLogCts = new CancellationTokenSource();
         IsLiveLogging = true;
         LiveFightCount = 0;
-        CurrentReportCode = null; // Reset
+        CurrentReportCode = null;
 
-        // Start live monitoring (runs in background)
         _ = Task.Run(async () =>
         {
             string? reportCode = null;
@@ -292,8 +266,8 @@ public class FFLogsService
                         CurrentReportCode = reportCode;
                     }
                     
-                    await UploadMasterTableAsync(reportCode, masterData);
-                    await UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true);
+                    await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData));
+                    await WithRetryAsync(() => UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true));
                     LiveFightCount++;
                 }, liveLogCts.Token);
             }
@@ -307,14 +281,9 @@ public class FFLogsService
             }
             finally
             {
-                // Terminate the report only if one was created
                 if (reportCode != null)
                 {
-                    try
-                    {
-                        await TerminateReportAsync(reportCode);
-                    }
-                    catch { }
+                    await TerminateReportAsync(reportCode);
                     Plugin.Log.Information($"[LiveLog] Live logging ended. Report: {reportCode}");
                 }
                 else
@@ -334,6 +303,27 @@ public class FFLogsService
             
         Plugin.Log.Information("[LiveLog] Stopping live logging...");
         liveLogCts?.Cancel();
+    }
+
+    /// <summary>
+    /// Executes an async action with exponential backoff retry.
+    /// </summary>
+    private async Task WithRetryAsync(Func<Task> action, int maxRetries = MaxRetries)
+    {
+        for (int attempt = 0; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                await action();
+                return;
+            }
+            catch (Exception ex) when (attempt < maxRetries)
+            {
+                var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt)); // 1s, 2s, 4s
+                Plugin.Log.Warning($"[Retry] Attempt {attempt + 1}/{maxRetries} failed: {ex.Message}. Retrying in {delay.TotalSeconds}s...");
+                await Task.Delay(delay);
+            }
+        }
     }
 
     private async Task UploadMasterTableAsync(string reportCode, string masterTableContent)
@@ -359,7 +349,7 @@ public class FFLogsService
 
     private async Task UploadSegmentAsync(string reportCode, FightData fight, int segmentId, long startTime, long endTime, bool isLive = false)
     {
-        // Format events like Python: header + count + events
+        // Format events: header + count + events
         var lines = fight.EventsString.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         var content = $"72|1\n{lines.Length}\n{fight.EventsString}";
         
@@ -374,14 +364,13 @@ public class FFLogsService
 
         var zipBytes = memoryStream.ToArray();
         
-        // Use global timestamps from fights data
         var parameters = new Dictionary<string, object>
         {
             ["startTime"] = startTime,
             ["endTime"] = endTime,
             ["mythic"] = 0,
-            ["isLiveLog"] = isLive,      // True for live logging
-            ["isRealTime"] = isLive,     // True for live logging
+            ["isLiveLog"] = isLive,
+            ["isRealTime"] = isLive,
             ["inProgressEventCount"] = 0,
             ["segmentId"] = segmentId
         };
@@ -398,9 +387,23 @@ public class FFLogsService
 
     private async Task TerminateReportAsync(string reportCode)
     {
-        var response = await HttpClient.PostAsync($"/desktop-client/terminate-report/{reportCode}", null);
-        // Don't throw on failure - terminate is optional
-        Plugin.Log.Debug($"Report terminated: {reportCode} (status: {response.StatusCode})");
+        try
+        {
+            await WithRetryAsync(async () =>
+            {
+                var response = await HttpClient.PostAsync($"/desktop-client/terminate-report/{reportCode}", null);
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new HttpRequestException($"Terminate failed with status {response.StatusCode}");
+                }
+                Plugin.Log.Debug($"Report terminated: {reportCode}");
+            });
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[TerminateReport] Failed to terminate report {reportCode} after {MaxRetries} retries: {ex.Message}. " +
+                               "The report may be left in an incomplete state on FFLogs — check the website.");
+        }
     }
 }
 
