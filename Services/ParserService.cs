@@ -123,7 +123,7 @@ public class ParserService : IDisposable
         {
             // Fetch the parser page
             var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
+            var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&gameContentDetectionEnabled=false&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
             
             var html = await HttpClient.GetStringAsync(parserPageUrl);
             

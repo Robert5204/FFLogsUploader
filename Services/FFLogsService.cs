@@ -20,7 +20,7 @@ namespace FFLogsPlugin.Services;
 public class FFLogsService
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
-    private const string CLIENT_VERSION = "8.19.39";
+    private const string CLIENT_VERSION = "8.20.113";
     private const int PARSER_VERSION = 1072;
     private const int MaxRetries = 3;
     
@@ -61,7 +61,7 @@ public class FFLogsService
         };
         
         // Match the official FFLogs client headers exactly
-        HttpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) FFLogsUploader/8.17.115 Chrome/138.0.7204.251 Electron/37.7.0 Safari/537.36");
+        HttpClient.DefaultRequestHeaders.Add("User-Agent", $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) FFLogsUploader/{CLIENT_VERSION} Chrome/138.0.7204.251 Electron/37.7.0 Safari/537.36");
         HttpClient.DefaultRequestHeaders.Add("Accept", "*/*");
         HttpClient.DefaultRequestHeaders.Add("Accept-Language", "en-US");
         HttpClient.DefaultRequestHeaders.Add("sec-ch-ua", "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\"");
@@ -70,6 +70,7 @@ public class FFLogsService
         HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Site", "cross-site");
         HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Mode", "cors");
         HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Dest", "empty");
+        HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Storage-Access", "active");
     }
 
     public async Task<bool> LoginAsync(string email, string password)
@@ -82,7 +83,7 @@ public class FFLogsService
             {
                 ["email"] = email,
                 ["password"] = password,
-                ["version"] = "8.17.115"
+                ["version"] = CLIENT_VERSION
             };
 
             var json = JsonSerializer.Serialize(payload);
