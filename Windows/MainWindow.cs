@@ -74,15 +74,42 @@ public class MainWindow : Window, IDisposable
         // Handle file dialog
         if (fileDialog != null)
         {
-            if (fileDialog.Draw())
+            try
             {
-                if (fileDialog.GetIsOk())
+                if (fileDialog.Draw())
                 {
-                    var results = fileDialog.GetResults();
-                    if (results.Count > 0)
+                    if (fileDialog.GetIsOk())
                     {
-                        logPath = isSelectingFolder ? fileDialog.GetCurrentPath() : results[0];
+                        var results = fileDialog.GetResults();
+                        if (results != null && results.Count > 0)
+                        {
+                            logPath = isSelectingFolder ? fileDialog.GetCurrentPath() : results[0];
+                        }
                     }
+                    fileDialog = null;
+                }
+            }
+            catch (NullReferenceException)
+            {
+                // Dalamud's ImGuiFileDialog throws NullReferenceException in
+                // AddFileNameInSelection when double-clicking a file. The selection
+                // path is still valid at this point, so extract it and close the dialog.
+                try
+                {
+                    var currentPath = fileDialog.GetCurrentPath();
+                    var results = fileDialog.GetResults();
+                    if (results != null && results.Count > 0)
+                    {
+                        logPath = isSelectingFolder ? currentPath : results[0];
+                    }
+                    else if (!string.IsNullOrEmpty(currentPath))
+                    {
+                        logPath = currentPath;
+                    }
+                }
+                catch
+                {
+                    // If even recovery fails, just close the dialog silently
                 }
                 fileDialog = null;
             }
