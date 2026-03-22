@@ -35,6 +35,10 @@ public class FFLogsService
     public string? Username { get; private set; }
     public List<GuildInfo> Guilds { get; private set; } = new();
 
+    // Recently uploaded report codes (for Parse Viewer)
+    public List<string> RecentReportCodes { get; } = new();
+    private const int MaxRecentReports = 10;
+
     // Live logging state
     public bool IsLiveLogging { get; private set; }
     public int LiveFightCount { get; private set; }
@@ -234,6 +238,7 @@ public class FFLogsService
         // 4. Terminate the report
         await TerminateReportAsync(reportCode);
 
+        TrackReportCode(reportCode);
         Plugin.Log.Information($"Upload complete: {reportCode}");
         return reportCode;
     }
@@ -285,6 +290,7 @@ public class FFLogsService
                 if (reportCode != null)
                 {
                     await TerminateReportAsync(reportCode);
+                    TrackReportCode(reportCode);
                     Plugin.Log.Information($"[LiveLog] Live logging ended. Report: {reportCode}");
                 }
                 else
@@ -295,6 +301,14 @@ public class FFLogsService
                 IsLiveLogging = false;
             }
         });
+    }
+
+    private void TrackReportCode(string code)
+    {
+        RecentReportCodes.Remove(code);
+        RecentReportCodes.Insert(0, code);
+        while (RecentReportCodes.Count > MaxRecentReports)
+            RecentReportCodes.RemoveAt(RecentReportCodes.Count - 1);
     }
 
     public void StopLiveLog()

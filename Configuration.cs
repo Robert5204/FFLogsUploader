@@ -15,6 +15,10 @@ public class Configuration : IPluginConfiguration
     public byte[]? EncryptionSalt { get; set; } = null; // Random per-install salt for AES key derivation
     public bool RememberCredentials { get; set; } = false;
 
+    // FFLogs API v2 client credentials (for fetching parses/rankings)
+    public string ApiClientId { get; set; } = string.Empty;
+    public string ApiClientSecret { get; set; } = string.Empty;
+
     // Default settings
     public string LogDirectory { get; set; } = string.Empty;
     public int Region { get; set; } = 1; // FFLogsRegion enum value: 1=NA, 2=EU, 3=JP, 4=CN, 5=KR

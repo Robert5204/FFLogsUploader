@@ -19,10 +19,12 @@ public sealed class Plugin : IDalamudPlugin
     public Configuration Configuration { get; init; }
     public FFLogsService FFLogsService { get; init; }
     public ParserService ParserService { get; init; }
+    public FFLogsApiService FFLogsApiService { get; init; }
 
     public readonly WindowSystem WindowSystem = new("FFLogsPlugin");
     private LoginWindow LoginWindow { get; init; }
     private MainWindow MainWindow { get; init; }
+    private ParseViewerWindow ParseViewerWindow { get; init; }
 
     public Plugin()
     {
@@ -31,13 +33,16 @@ public sealed class Plugin : IDalamudPlugin
         // Initialize services
         FFLogsService = new FFLogsService(this);
         ParserService = new ParserService(this);
+        FFLogsApiService = new FFLogsApiService(this);
 
         // Initialize windows
         LoginWindow = new LoginWindow(this);
         MainWindow = new MainWindow(this);
+        ParseViewerWindow = new ParseViewerWindow(this);
 
         WindowSystem.AddWindow(LoginWindow);
         WindowSystem.AddWindow(MainWindow);
+        WindowSystem.AddWindow(ParseViewerWindow);
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
@@ -75,6 +80,7 @@ public sealed class Plugin : IDalamudPlugin
 
         LoginWindow.Dispose();
         MainWindow.Dispose();
+        ParseViewerWindow.Dispose();
         ParserService.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
@@ -108,5 +114,10 @@ public sealed class Plugin : IDalamudPlugin
     {
         MainWindow.IsOpen = false;
         LoginWindow.IsOpen = true;
+    }
+
+    public void ShowParseViewer(string reportCode)
+    {
+        ParseViewerWindow.OpenWithReport(reportCode);
     }
 }

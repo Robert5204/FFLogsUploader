@@ -96,7 +96,7 @@ public class MainWindow : Window, IDisposable
                 // path is still valid at this point, so extract it and close the dialog.
                 try
                 {
-                    var currentPath = fileDialog.GetCurrentPath();
+                    var currentPath = fileDialog!.GetCurrentPath();
                     var results = fileDialog.GetResults();
                     if (results != null && results.Count > 0)
                     {
@@ -134,8 +134,6 @@ public class MainWindow : Window, IDisposable
 
             ImGui.EndTabBar();
         }
-
-        DrawStatus();
     }
 
     private void DrawHeader()
@@ -168,7 +166,7 @@ public class MainWindow : Window, IDisposable
                 "SelectLogFolder",
                 "Select Log Folder",
                 string.Empty,
-                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                GetDialogStartPath(),
                 string.Empty,
                 string.Empty,
                 1,
@@ -213,6 +211,15 @@ public class MainWindow : Window, IDisposable
             }
             
             ImGui.PopStyleColor(3);
+            
+            if (plugin.FFLogsService.LiveFightCount > 0 && !string.IsNullOrEmpty(plugin.FFLogsService.CurrentReportCode))
+            {
+                ImGui.Spacing();
+                if (ImGui.Button("View Parses", new Vector2(-1, 30)))
+                {
+                    plugin.ShowParseViewer(plugin.FFLogsService.CurrentReportCode);
+                }
+            }
         }
         else
         {
@@ -243,7 +250,7 @@ public class MainWindow : Window, IDisposable
                 "SelectLogFile",
                 "Select Log File",
                 ".log,.txt",
-                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                GetDialogStartPath(),
                 string.Empty,
                 string.Empty,
                 1,
@@ -258,6 +265,8 @@ public class MainWindow : Window, IDisposable
         ImGui.Spacing();
 
         DrawGoButton("Go!", StartUpload);
+
+        DrawStatus();
     }
 
     private void DrawSharedOptions()
@@ -309,6 +318,27 @@ public class MainWindow : Window, IDisposable
         return null;
     }
 
+    /// <summary>
+    /// Returns the best starting directory for the file dialog based on the current logPath.
+    /// </summary>
+    private string GetDialogStartPath()
+    {
+        if (!string.IsNullOrWhiteSpace(logPath))
+        {
+            // If logPath is a file, use its directory
+            if (System.IO.File.Exists(logPath))
+            {
+                var dir = System.IO.Path.GetDirectoryName(logPath);
+                if (!string.IsNullOrEmpty(dir))
+                    return dir;
+            }
+            // If logPath is a directory, use it directly
+            if (System.IO.Directory.Exists(logPath))
+                return logPath;
+        }
+        return Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+    }
+
     private void DrawGoButton(string label, Action action)
     {
         if (isProcessing) ImGui.BeginDisabled();
@@ -326,6 +356,16 @@ public class MainWindow : Window, IDisposable
         {
             ImGui.Separator();
             ImGui.TextWrapped(statusMessage);
+
+            // Show View Parses button when upload is complete
+            if (statusMessage.StartsWith("Upload complete!") && plugin.FFLogsService.RecentReportCodes.Count > 0)
+            {
+                ImGui.Spacing();
+                if (ImGui.Button("View Parses##status", new Vector2(-1, 30)))
+                {
+                    plugin.ShowParseViewer(plugin.FFLogsService.RecentReportCodes[0]);
+                }
+            }
         }
     }
 
