@@ -1,34 +1,32 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
-using System.Runtime.InteropServices;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 using FFLogsPlugin.Helpers;
 using FFLogsPlugin.Models;
+using Microsoft.ClearScript.V8;
 
 namespace FFLogsPlugin.Services;
 
 /// <summary>
-/// Manages the FFLogs parser by calling Node.js subprocess directly.
+/// Manages the FFLogs parser using an embedded V8 JavaScript engine (ClearScript).
+/// No Node.js subprocess required.
 /// </summary>
 public class ParserService : IDisposable
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
 
-    // Configurable timing constants (formerly hardcoded magic numbers)
+    // Configurable timing constants
     private const int LiveLogPollIntervalMs = 500;
     private const int FightEndDelayMs = 5000;
     private const int FileCheckIntervalSeconds = 10;
 
-    // Parser page query parameters — exposed as constants for future configurability
+    // Parser page query parameters
     private const string ParserMetersEnabled = "false";
     private const string ParserLiveFightDataEnabled = "false";
 
@@ -38,7 +36,7 @@ public class ParserService : IDisposable
     /// </summary>
     private static readonly HashSet<string> FightEndDirectorCodes = new()
     {
-        "40000011", // Wipe cleanup — entities cleared after a wipe
+        "40000011", // Wipe cleanup
         "40000002", // Victory / duty complete
         "40000003", // Duty complete (alternative)
         "40000005", // Duty complete (alternative)
@@ -46,16 +44,9 @@ public class ParserService : IDisposable
 
     private readonly Plugin plugin;
     private string? parserBundlePath;
-    private Process? parserProcess;
-    private int sendCounter = 0; // Instance field, not static — each service instance tracks its own counter
-
-    // Channel-based IPC: messages arrive from the output reader and are consumed by WaitForMessageAsync
-    private Channel<JsonElement>? ipcChannel;
-    // Buffer for messages that didn't match the current wait predicate (put-back)
-    // Capped to prevent unbounded growth during long live-logging sessions with repeated timeouts
-    private const int MaxBufferSize = 500;
-    private readonly List<JsonElement> ipcBuffer = new();
-    private readonly object bufferLock = new();
+    private V8ScriptEngine? engine;
+    private readonly List<JsonElement> ipcMessages = new();
+    private readonly object ipcLock = new();
 
     // Use the authenticated HttpClient from FFLogsService
     private HttpClient HttpClient => plugin.FFLogsService.HttpClient;
@@ -73,22 +64,21 @@ public class ParserService : IDisposable
 
     ~ParserService()
     {
-        // Guarantee cleanup of orphaned Node processes even if Dispose wasn't called
         StopParser();
     }
 
     private void StopParser()
     {
-        if (parserProcess != null && !parserProcess.HasExited)
+        if (engine != null)
         {
-            try { parserProcess.Kill(); } catch { }
-            parserProcess.Dispose();
-            parserProcess = null;
+            try { engine.Dispose(); } catch { }
+            engine = null;
         }
     }
 
     /// <summary>
     /// Ensures the parser bundle is downloaded, validated, and cached.
+    /// The cached bundle now stores only the raw parser + glue code (no Node.js wrapper).
     /// </summary>
     private async Task EnsureParserAsync()
     {
@@ -97,12 +87,11 @@ public class ParserService : IDisposable
             "XIVLauncher", "pluginConfigs", "FFLogsPlugin"
         );
         Directory.CreateDirectory(cacheDir);
-        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_bundle.js");
+        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_v8.js");
 
         // If cached and fresh (< 24 hours), validate and use it
         if (File.Exists(parserBundlePath) && File.GetLastWriteTimeUtc(parserBundlePath) > DateTime.UtcNow.AddHours(-24))
         {
-            // Validate cached bundle isn't corrupted (e.g. disk full during previous write)
             var cachedSize = new FileInfo(parserBundlePath).Length;
             if (cachedSize > 10000)
             {
@@ -115,36 +104,30 @@ public class ParserService : IDisposable
         }
 
         Plugin.Log.Information("Downloading FFLogs parser...");
-        
-        // Download to a temp file first so we don't cache partial/invalid downloads
         var tempPath = parserBundlePath + ".tmp";
-        
+
         try
         {
             // Fetch the parser page
             var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&gameContentDetectionEnabled=false&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
-            
+
             var html = await HttpClient.GetStringAsync(parserPageUrl);
-            
+
             // Extract parser URL from HTML
             var match = Regex.Match(html, @"src=""([^""]+parser-ff[^""]+)""");
             if (!match.Success)
             {
                 throw new Exception("Could not find parser URL in response");
             }
-            
+
             var parserUrl = match.Groups[1].Value;
             Plugin.Log.Debug($"Found parser URL: {parserUrl}");
-            
+
             // Download the parser
             var parserCode = await HttpClient.GetStringAsync(parserUrl);
-            
+
             // Extract inline glue code
-            // Find all inline <script type="text/javascript"> blocks,
-            // then pick the one that contains the ipcCollectFights function.
-            // Using per-block matching avoids crossing </script>...<script> boundaries
-            // which would embed raw HTML tags into the JS bundle.
             var scriptBlocks = Regex.Matches(html, @"<script type=""text/javascript"">([\s\S]*?)</script>");
             var glueCode = "";
             foreach (Match m in scriptBlocks)
@@ -155,336 +138,193 @@ public class ParserService : IDisposable
                     break;
                 }
             }
-            
-            // Create runner wrapper
-            var runnerCode = @"
-const fs = require('fs');
-const readline = require('readline');
 
-// Mock browser environment
-const window = {
-    location: { search: '?id=1&metersEnabled=false&liveFightDataEnabled=false' },
-    addEventListener: (type, listener) => { if (type === 'message') global.messageListener = listener; },
-    removeEventListener: () => {},
-    dispatchEvent: () => true
-};
-const document = {
-    createElement: () => ({ style: {}, appendChild: () => {}, addEventListener: () => {} }),
-    getElementsByTagName: () => [{ appendChild: () => {} }],
-    getElementById: () => null,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-    body: { appendChild: () => {} },
-    head: { appendChild: () => {} },
-    readyState: 'complete',
-    addEventListener: () => {},
-    removeEventListener: () => {}
-};
-global.window = window;
-global.document = document;
-global.self = window;
-global.navigator = { userAgent: 'FFLogsPlugin/1.0', platform: 'Win32' };
-global.location = window.location;
-global.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
-global.sessionStorage = global.localStorage;
-global.setTimeout = (fn) => { fn(); return 0; };
-global.setInterval = () => 0;
-global.clearTimeout = () => {};
-global.clearInterval = () => {};
-global.performance = { now: () => Date.now() };
-global.fetch = () => Promise.reject('fetch not supported');
-global.URLSearchParams = class {
-    constructor(init) { this._params = {}; }
-    get(k) { return this._params[k]; }
-    set(k, v) { this._params[k] = v; }
-};
-global.URL = class {
-    constructor(url) { this.href = url; this.searchParams = new URLSearchParams(); }
-};
-global.TextEncoder = class { encode(s) { return Buffer.from(s); } };
-global.TextDecoder = class { decode(b) { return b.toString(); } };
+            // Bundle parser + glue only (no Node.js wrapper needed)
+            var fullBundle = parserCode + "\n\n" + glueCode;
 
-// IPC output
-window.sendToHost = (channel, id, event, data) => {
-    console.log('__IPC__:' + JSON.stringify({ channel, id, data }));
-};
-
-// Readline for input
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-rl.on('line', (line) => {
-    if (!line.trim()) return;
-    try {
-        const msg = JSON.parse(line);
-        if (global.messageListener) {
-            global.messageListener({
-                data: msg,
-                source: { postMessage: (r) => console.log('__IPC__:' + JSON.stringify(r)) },
-                origin: 'emulator'
-            });
-        }
-    } catch (e) {
-        console.error('Parse error:', e.message);
-    }
-});
-
-console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
-
-";
-
-            // Bundle everything
-            var fullBundle = runnerCode + "\n\n" + parserCode + "\n\n" + glueCode;
-            
-            // Validate that the bundle looks like valid parser JS
+            // Validate
             if (fullBundle.Length < 10000 || !fullBundle.Contains("ipcCollectFights"))
             {
                 throw new Exception($"Downloaded parser bundle appears invalid (size={fullBundle.Length}, missing expected markers). " +
                                     "This may be a partial download or a Cloudflare error page.");
             }
 
-            // Detect HTML contamination — raw script/HTML tags should never appear in valid JS
             if (fullBundle.Contains("<script") || fullBundle.Contains("</script>"))
             {
                 throw new Exception("Parser bundle contains raw HTML tags — " +
                     "the FFLogs parser page structure may have changed. " +
                     "Please report this issue.");
             }
-            
-            // Write to temp file, then rename — atomic-ish to avoid caching partial downloads
+
             await File.WriteAllTextAsync(tempPath, fullBundle);
-            
+
             if (File.Exists(parserBundlePath))
                 File.Delete(parserBundlePath);
             File.Move(tempPath, parserBundlePath);
-            
+
             Plugin.Log.Information($"Parser downloaded and cached ({fullBundle.Length} bytes)");
         }
         catch (Exception ex)
         {
-            // Clean up temp file on failure
             try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
             Plugin.Log.Error(ex, "Failed to download parser");
             throw new Exception($"Failed to download parser: {ex.Message}");
         }
     }
 
-    private async Task StartParserProcessAsync()
+    /// <summary>
+    /// Browser environment shims for the FFLogs parser JavaScript.
+    /// Provides mock window, document, and Web API objects that the parser expects.
+    /// </summary>
+    private const string BrowserShimsJs = @"
+        var window = {
+            location: { search: '?id=1&metersEnabled=false&liveFightDataEnabled=false' },
+            addEventListener: function(type, listener) { if (type === 'message') { this._messageListener = listener; } },
+            removeEventListener: function() {},
+            dispatchEvent: function() { return true; },
+            _messageListener: null
+        };
+        var document = {
+            createElement: function() { return { style: {}, appendChild: function(){}, addEventListener: function(){} }; },
+            getElementsByTagName: function() { return [{ appendChild: function(){} }]; },
+            getElementById: function() { return null; },
+            querySelector: function() { return null; },
+            querySelectorAll: function() { return []; },
+            body: { appendChild: function(){} },
+            head: { appendChild: function(){} },
+            readyState: 'complete',
+            addEventListener: function() {},
+            removeEventListener: function() {}
+        };
+        var self = window;
+        var navigator = { userAgent: 'FFLogsPlugin/1.0', platform: 'Win32' };
+        var location = window.location;
+        var localStorage = { getItem: function() { return null; }, setItem: function() {}, removeItem: function() {} };
+        var sessionStorage = localStorage;
+
+        var _timerId = 0;
+        function setTimeout(fn, delay) { var id = ++_timerId; if (typeof fn === 'function') { try { fn(); } catch(e) {} } return id; }
+        function setInterval() { return ++_timerId; }
+        function clearTimeout() {}
+        function clearInterval() {}
+        var performance = { now: function() { return Date.now(); } };
+        function fetch() { throw new Error('fetch not supported'); }
+
+        var URLSearchParams = function(init) {
+            this._params = {};
+            if (typeof init === 'string') {
+                var str = init.charAt(0) === '?' ? init.substring(1) : init;
+                var pairs = str.split('&');
+                for (var i = 0; i < pairs.length; i++) {
+                    var kv = pairs[i].split('=');
+                    if (kv.length === 2) this._params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
+                }
+            }
+        };
+        URLSearchParams.prototype.get = function(k) { return this._params.hasOwnProperty(k) ? this._params[k] : null; };
+        URLSearchParams.prototype.set = function(k, v) { this._params[k] = v; };
+        URLSearchParams.prototype.has = function(k) { return this._params.hasOwnProperty(k); };
+
+        // IPC output — calls back into C# via host object
+        window.sendToHost = function(channel, id, event, data) {
+            __ipc.capture(JSON.stringify({ channel: channel, id: id, data: data }));
+        };
+
+        // Helper to dispatch a message to the parser (replaces stdin JSON protocol)
+        function __dispatchMessage(msgJson) {
+            if (!window._messageListener) throw new Error('Parser not initialized: no message listener');
+            var msg = JSON.parse(msgJson);
+            window._messageListener({
+                data: msg,
+                source: { postMessage: function(r) { __ipc.capture(JSON.stringify(r)); } },
+                origin: 'emulator'
+            });
+        }
+    ";
+
+    private async Task StartParserAsync()
     {
         await EnsureParserAsync();
 
-        // Kill any existing process to start fresh
-        if (parserProcess != null)
-        {
-            try
-            {
-                if (!parserProcess.HasExited)
-                {
-                    parserProcess.Kill();
-                    parserProcess.WaitForExit(1000);
-                }
-                parserProcess.Dispose();
-            }
-            catch { }
-            parserProcess = null;
-        }
+        // Dispose any existing engine
+        StopParser();
 
-        // Check for bundled node.exe in plugin directory first
-        var pluginDir = Plugin.PluginInterface.AssemblyLocation.Directory?.FullName;
-        var bundledNode = pluginDir != null ? Path.Combine(pluginDir, "node.exe") : null;
-        var nodeExecutable = (bundledNode != null && File.Exists(bundledNode)) ? bundledNode : "node";
-        
-        if (bundledNode != null && File.Exists(bundledNode))
-        {
-            Plugin.Log.Information($"Using bundled Node.js: {bundledNode}");
-        }
-        else
-        {
-            Plugin.Log.Information("Using system Node.js");
-        }
+        Plugin.Log.Information("Starting V8 parser engine...");
+        engine = new V8ScriptEngine();
 
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = nodeExecutable,
-            Arguments = $"\"{parserBundlePath}\"",
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            WorkingDirectory = Path.GetDirectoryName(parserBundlePath)!
-        };
+        // Register IPC callback host object
+        engine.AddHostObject("__ipc", new IpcHost(this));
 
-        parserProcess = new Process { StartInfo = startInfo };
-        
-        // Create a fresh channel for this process
-        ipcChannel = Channel.CreateUnbounded<JsonElement>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        });
-        lock (bufferLock) ipcBuffer.Clear();
+        // Set up browser shims
+        engine.Execute(BrowserShimsJs);
 
-        parserProcess.OutputDataReceived += (sender, args) =>
-        {
-            if (args.Data == null) return;
-            if (args.Data.StartsWith("__IPC__:"))
-            {
-                try
-                {
-                    var json = args.Data.Substring(8);
-                    var doc = JsonDocument.Parse(json);
-                    ipcChannel?.Writer.TryWrite(doc.RootElement.Clone());
-                }
-                catch (Exception ex)
-                {
-                    Plugin.Log.Debug($"IPC parse error: {ex.Message}");
-                }
-            }
-            else
-            {
-                Plugin.Log.Debug($"[Parser] {args.Data}");
-            }
-        };
+        // Load the parser bundle
+        var bundleCode = await File.ReadAllTextAsync(parserBundlePath!);
+        engine.Execute(bundleCode);
 
-        parserProcess.ErrorDataReceived += (sender, args) =>
-        {
-            if (args.Data != null)
-                Plugin.Log.Warning($"[Parser stderr] {args.Data}");
-        };
+        // Verify the parser registered its message listener
+        var hasListener = engine.Evaluate("!!window._messageListener");
+        if (hasListener is not true)
+            throw new Exception("Parser did not register a message listener — bundle may be invalid");
 
-        parserProcess.Start();
-        parserProcess.BeginOutputReadLine();
-        parserProcess.BeginErrorReadLine();
-
-        // Wait for ready signal
-        var readyMsg = await WaitForMessageAsync(
-            e => e.TryGetProperty("channel", out var c) && c.GetString() == "ready",
-            timeoutMs: 10000);
-
-        if (readyMsg == null)
-            throw new Exception("Parser process did not start in time");
-
-        Plugin.Log.Information("Parser process ready");
-    }
-
-    private async Task SendMessageAsync(object message)
-    {
-        if (parserProcess == null || parserProcess.HasExited)
-            throw new InvalidOperationException("Parser process is not running");
-        
-        var seq = Interlocked.Increment(ref sendCounter);
-        var json = JsonSerializer.Serialize(message);
-        await parserProcess.StandardInput.WriteLineAsync(json);
-        await parserProcess.StandardInput.FlushAsync();
-        Plugin.Log.Debug($"[Parser] Sent #{seq}: {json.Substring(0, Math.Min(200, json.Length))}...");
+        Plugin.Log.Information("V8 parser engine ready");
     }
 
     /// <summary>
-    /// Unified message waiting method. Reads from the IPC channel until a message
-    /// matching the predicate is found, or the timeout expires.
-    /// Non-matching messages are buffered for future waits.
-    /// Optionally transforms the matched message before returning.
+    /// Send a message to the parser and collect any IPC responses.
+    /// V8 calls are synchronous, so responses are available immediately after execution.
     /// </summary>
-    private async Task<JsonElement?> WaitForMessageAsync(
-        Func<JsonElement, bool> predicate,
-        Func<JsonElement, JsonElement>? transform = null,
-        int timeoutMs = 10000,
-        CancellationToken ct = default)
+    private void SendMessage(object message)
     {
-        if (ipcChannel == null) return null;
+        if (engine == null)
+            throw new InvalidOperationException("Parser engine is not running");
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeoutMs);
+        var json = JsonSerializer.Serialize(message);
+        Plugin.Log.Debug($"[Parser] Sending: {json[..Math.Min(200, json.Length)]}...");
 
-        // First check the buffer for an already-received matching message
-        lock (bufferLock)
+        lock (ipcLock)
         {
-            for (int i = 0; i < ipcBuffer.Count; i++)
-            {
-                if (predicate(ipcBuffer[i]))
-                {
-                    var match = ipcBuffer[i];
-                    ipcBuffer.RemoveAt(i);
-                    return transform != null ? transform(match) : match;
-                }
-            }
+            ipcMessages.Clear();
         }
 
-        // Read from the channel until we find a match or timeout
-        try
-        {
-            while (await ipcChannel.Reader.WaitToReadAsync(timeoutCts.Token))
-            {
-                while (ipcChannel.Reader.TryRead(out var item))
-                {
-                    if (predicate(item))
-                    {
-                        return transform != null ? transform(item) : item;
-                    }
-                    
-                    // Not a match — buffer it for future waits (with cap to prevent unbounded growth)
-                    lock (bufferLock)
-                    {
-                        if (ipcBuffer.Count >= MaxBufferSize)
-                        {
-                            ipcBuffer.RemoveAt(0); // Evict oldest
-                        }
-                        ipcBuffer.Add(item);
-                    }
-                }
-            }
-        }
-        catch (OperationCanceledException) { }
+        engine.Execute($"__dispatchMessage({JsonSerializer.Serialize(json)})");
+    }
 
+    /// <summary>
+    /// Send a message and return all IPC responses collected during execution.
+    /// </summary>
+    private List<JsonElement> SendMessageAndCollect(object message)
+    {
+        SendMessage(message);
+        lock (ipcLock)
+        {
+            return new List<JsonElement>(ipcMessages);
+        }
+    }
+
+    /// <summary>
+    /// Find the first IPC response containing a specific key.
+    /// Checks both wrapped (data.key) and direct (key) formats.
+    /// Returns the unwrapped element containing the key.
+    /// </summary>
+    private JsonElement? FindResponseWithKey(List<JsonElement> responses, string key)
+    {
+        foreach (var msg in responses)
+        {
+            if (msg.TryGetProperty("data", out var d) && d.TryGetProperty(key, out _))
+                return d;
+            if (msg.TryGetProperty(key, out _))
+                return msg;
+        }
         return null;
     }
 
     /// <summary>
-    /// Wait for a message on a specific IPC channel name (e.g. "ready").
-    /// </summary>
-    private Task<JsonElement?> WaitForChannelAsync(string channel, int timeoutMs = 10000, CancellationToken ct = default)
-    {
-        return WaitForMessageAsync(
-            e => e.TryGetProperty("channel", out var c) && c.GetString() == channel,
-            timeoutMs: timeoutMs,
-            ct: ct);
-    }
-
-    /// <summary>
-    /// Wait for a message containing a specific key in its data payload.
-    /// Checks both wrapped format (data.key) and direct format (key).
-    /// Returns the unwrapped data element containing the key.
-    /// </summary>
-    private Task<JsonElement?> WaitForKeyAsync(string key, int timeoutMs = 10000, CancellationToken ct = default)
-    {
-        // Capture the resolved element during predicate evaluation to avoid redundant lookups in the transform
-        JsonElement resolvedElement = default;
-
-        return WaitForMessageAsync(
-            e =>
-            {
-                if (e.TryGetProperty("data", out var d) && d.TryGetProperty(key, out _))
-                {
-                    resolvedElement = d;
-                    return true;
-                }
-                if (e.TryGetProperty(key, out _))
-                {
-                    resolvedElement = e;
-                    return true;
-                }
-                return false;
-            },
-            transform: _ => resolvedElement,
-            timeoutMs: timeoutMs,
-            ct: ct);
-    }
-
-    /// <summary>
-    /// Process a log file using the Node.js parser.
+    /// Process a log file using the embedded V8 parser.
     /// </summary>
     public async Task<(string masterData, List<FightData> fights, long startTime, long endTime)> ProcessLogAsync(string logPath, string reportCode, int region)
     {
-        await StartParserProcessAsync();
+        await StartParserAsync();
 
         var fights = new List<FightData>();
         long startTime = 0;
@@ -495,32 +335,27 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         {
             Plugin.Log.Information($"[Parser] Processing log: {Path.GetFileName(logPath)}");
 
-            // Read log file with sharing enabled (ACT may have it open)
             var lines = await LogFileHelper.ReadAllLinesSharedAsync(logPath);
             Plugin.Log.Debug($"[Parser] Read {lines.Length} lines");
 
             var regionStr = ((FFLogsRegion)region).ToCode();
 
             // Set report code
-            await SendMessageAsync(new { message = "set-report-code", id = 0, reportCode });
-            await Task.Delay(100);
+            SendMessage(new { message = "set-report-code", id = 0, reportCode });
 
             // Parse lines
-            await SendMessageAsync(new
+            SendMessage(new
             {
                 message = "parse-lines",
                 id = 1,
-                lines = lines,
+                lines,
                 scanning = false,
                 selectedRegion = regionStr,
                 raidsToUpload = Array.Empty<int>()
             });
 
-            // Wait for parsing to complete (longer for large files)
-            await Task.Delay(Math.Max(500, lines.Length / 100));
-
             // Collect fights
-            await SendMessageAsync(new
+            var fightsResponses = SendMessageAndCollect(new
             {
                 message = "collect-fights",
                 id = 2,
@@ -528,9 +363,8 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 scanningOnly = false
             });
 
-            // Wait for fights data
-            var fightsResult = await WaitForKeyAsync("fights", 15000);
-            
+            var fightsResult = FindResponseWithKey(fightsResponses, "fights");
+
             if (fightsResult.HasValue)
             {
                 Plugin.Log.Debug($"[Parser] Got fights result with {(fightsResult.Value.TryGetProperty("fights", out var f) ? f.GetArrayLength() : 0)} fights");
@@ -538,32 +372,19 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             else
             {
                 Plugin.Log.Warning("[Parser] No fights result received!");
-                lock (bufferLock)
-                {
-                    Plugin.Log.Debug($"[Parser] Buffer has {ipcBuffer.Count} messages");
-                    foreach (var msg in ipcBuffer)
-                    {
-                        var keys = new List<string>();
-                        foreach (var prop in msg.EnumerateObject())
-                            keys.Add(prop.Name);
-                        Plugin.Log.Debug($"[Parser] Message keys: {string.Join(", ", keys)}");
-                    }
-                }
             }
-            
+
             // Collect master info
-            await SendMessageAsync(new
+            var masterResponses = SendMessageAndCollect(new
             {
                 message = "collect-master-info",
                 id = 3,
                 reportCode
             });
 
-            // Wait for master data
-            var masterResult = await WaitForKeyAsync("actorsString", 15000);
+            var masterResult = FindResponseWithKey(masterResponses, "actorsString");
 
-            // Extract fights array — WaitForKeyAsync already unwraps the data envelope,
-            // so fightsResult directly contains the element with "fights" as a property.
+            // Extract fights
             if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
             {
                 foreach (var fight in fightsArray.EnumerateArray())
@@ -577,7 +398,6 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                     });
                 }
 
-                // Global timestamps live on the same unwrapped element
                 var fr = fightsResult.Value;
                 startTime = fr.TryGetProperty("startTime", out var st) ? st.GetInt64() : 0;
                 endTime = fr.TryGetProperty("endTime", out var et) ? et.GetInt64() : 0;
@@ -586,8 +406,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             Plugin.Log.Information($"[Parser] Extracted {fights.Count} fights");
             if (masterResult.HasValue)
             {
-                JsonElement? fightsHeader = fightsResult;
-                masterStr = BuildMasterTableString(fightsHeader, masterResult.Value);
+                masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
             }
         }
         finally
@@ -600,28 +419,23 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
 
     /// <summary>
     /// Builds the master table string that FFLogs expects for report uploads.
-    /// 
+    ///
     /// Format (proprietary FFLogs format):
-    ///   Line 1: "{logVersion}|{gameVersion}|{logFileDetails}"    — header from fights data
+    ///   Line 1: "{logVersion}|{gameVersion}|{logFileDetails}"
     ///   Then for each section (in strict order):
     ///     - Line: count of entries
     ///     - Lines: the entries themselves
-    /// 
-    /// Section order must match the official FFLogs client:
-    ///   1. actorsString   — combat actors (players, enemies, NPCs) with IDs and names
-    ///   2. abilitiesString — all abilities/spells seen in the log with IDs and names
-    ///   3. tuplesString   — actor-ability tuples linking who used what
-    ///   4. petsString     — pet/companion actors and their owners
+    ///
+    /// Section order: actorsString, abilitiesString, tuplesString, petsString
     /// </summary>
     private string BuildMasterTableString(JsonElement? fightsData, JsonElement masterData)
     {
         var parts = new List<string>();
 
-        // Header info comes from fights data
         var logVersion = 72;
         var gameVersion = 1;
         var logFileDetails = "";
-        
+
         if (fightsData.HasValue)
         {
             var fd = fightsData.Value;
@@ -630,12 +444,10 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             logFileDetails = fd.TryGetProperty("logFileDetails", out var lfd) ? lfd.GetString() ?? "" : "";
         }
 
-        // Header line
         parts.Add($"{logVersion}|{gameVersion}|{logFileDetails}");
 
-        // Sections in strict order (must match official FFLogs client — see summary above)
         string[] sectionKeys = { "actorsString", "abilitiesString", "tuplesString", "petsString" };
-        
+
         foreach (var key in sectionKeys)
         {
             var value = "";
@@ -643,11 +455,11 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             {
                 value = prop.GetString() ?? "";
             }
-            
+
             var lines = value.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                              .Where(l => !string.IsNullOrWhiteSpace(l))
                              .ToList();
-            
+
             parts.Add(lines.Count.ToString());
             parts.AddRange(lines);
         }
@@ -667,7 +479,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
         Func<string, FightData, int, long, long, Task> onFightComplete,
         CancellationToken cancellationToken = default)
     {
-        await StartParserProcessAsync();
+        await StartParserAsync();
 
         try
         {
@@ -717,7 +529,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                 if (existingLines.Count > 0)
                 {
                     Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
-                    await SendMessageAsync(new
+                    SendMessage(new
                     {
                         message = "parse-lines",
                         id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -726,13 +538,11 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                         selectedRegion = regionStr,
                         raidsToUpload = Array.Empty<object>()
                     });
-
-                    await Task.Delay(Math.Max(500, existingLines.Count / 100), cancellationToken);
                 }
 
                 if (!uploadPreviousFights)
                 {
-                    await SendMessageAsync(new
+                    var responses = SendMessageAndCollect(new
                     {
                         message = "collect-fights",
                         id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -740,7 +550,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                         scanningOnly = false
                     });
 
-                    var existingFights = await WaitForKeyAsync("fights", 5000, cancellationToken);
+                    var existingFights = FindResponseWithKey(responses, "fights");
                     if (existingFights.HasValue && existingFights.Value.TryGetProperty("fights", out var fa))
                     {
                         lastFightCount = fa.GetArrayLength();
@@ -767,7 +577,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                         checkPending = false;
 
                         // Send lines to parser
-                        await SendMessageAsync(new
+                        SendMessage(new
                         {
                             message = "parse-lines",
                             id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -777,23 +587,14 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                             raidsToUpload = Array.Empty<object>()
                         });
 
-                        if (firstPass && uploadPreviousFights && newLines.Count > 1000)
-                        {
-                            await Task.Delay(Math.Max(500, newLines.Count / 100), cancellationToken);
-                        }
-                        else
-                        {
-                            await Task.Delay(100, cancellationToken);
-                        }
-
-                        // Scan for fight-end Director commands using centralized code set
+                        // Scan for fight-end Director commands
                         if (!fightEndDetected)
                         {
                             foreach (var line in newLines)
                             {
                                 if (line.StartsWith("33|") && FightEndDirectorCodes.Any(code => line.Contains($"|{code}|")))
                                 {
-                                    Plugin.Log.Information($"[LiveLog] Fight end detected (Director): {line.Substring(0, Math.Min(80, line.Length))}");
+                                    Plugin.Log.Information($"[LiveLog] Fight end detected (Director): {line[..Math.Min(80, line.Length)]}");
                                     fightEndDetected = true;
                                     fightEndDetectedTime = DateTime.UtcNow;
                                     break;
@@ -803,7 +604,6 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                     }
 
                     // Check for a newer log file periodically
-                    // Reduced from 60s to 10s to minimize gap between old and new file
                     if ((DateTime.UtcNow - lastFileCheckTime).TotalSeconds > FileCheckIntervalSeconds)
                     {
                         lastFileCheckTime = DateTime.UtcNow;
@@ -813,12 +613,11 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                             var newestFile = currentFiles.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
                             if (newestFile != logPath)
                             {
-                                // Finish reading the remainder of the old file before switching
                                 var (remainingLines, _) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, lastPosition);
                                 if (remainingLines.Count > 0)
                                 {
                                     Plugin.Log.Information($"[LiveLog] Reading {remainingLines.Count} remaining lines from old file before switching");
-                                    await SendMessageAsync(new
+                                    SendMessage(new
                                     {
                                         message = "parse-lines",
                                         id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -827,7 +626,6 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                                         selectedRegion = regionStr,
                                         raidsToUpload = Array.Empty<object>()
                                     });
-                                    await Task.Delay(100, cancellationToken);
                                 }
 
                                 Plugin.Log.Information($"[LiveLog] Switching to newer log file: {Path.GetFileName(newestFile)}");
@@ -837,9 +635,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                         }
                     }
 
-                    // Check for fights when:
-                    // 1. Fight end detected via Director command (after configurable delay for parser to finalize)
-                    // 2. On first pass with uploadPreviousFights
+                    // Check for fights
                     bool forceCheck = firstPass && uploadPreviousFights;
                     bool fightEndCheck = fightEndDetected && (DateTime.UtcNow - fightEndDetectedTime).TotalMilliseconds >= FightEndDelayMs;
 
@@ -873,7 +669,7 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
             Plugin.Log.Information("[LiveLog] Stopped");
 
             // Final check: Upload any remaining fights
-            if (parserProcess != null)
+            if (engine != null)
             {
                 Plugin.Log.Information("[LiveLog] Final check for remaining fights...");
                 try
@@ -894,41 +690,41 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
 
     private async Task<int> CheckForFightsAsync(int lastFightCount, Func<string, FightData, int, long, long, Task> onFightComplete, bool pushFightIfNeeded = false)
     {
-        await SendMessageAsync(new
+        var fightsResponses = SendMessageAndCollect(new
         {
             message = "collect-fights",
             id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            pushFightIfNeeded = pushFightIfNeeded,
+            pushFightIfNeeded,
             scanningOnly = false
         });
-        
-        var fightsResult = await WaitForKeyAsync("fights", 5000);
-        
+
+        var fightsResult = FindResponseWithKey(fightsResponses, "fights");
+
         if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
         {
             var currentCount = fightsArray.GetArrayLength();
-            
+
             if (currentCount > lastFightCount)
             {
                 var newCount = currentCount - lastFightCount;
                 Plugin.Log.Information($"[LiveLog] {newCount} NEW fight(s) detected!");
-                
-                await SendMessageAsync(new
+
+                var masterResponses = SendMessageAndCollect(new
                 {
                     message = "collect-master-info",
                     id = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
                 });
-                
-                var masterResult = await WaitForKeyAsync("actorsString", 5000);
-                
+
+                var masterResult = FindResponseWithKey(masterResponses, "actorsString");
+
                 if (masterResult.HasValue)
                 {
                     var fr = fightsResult.Value;
                     long globalStartTime = fr.TryGetProperty("startTime", out var gst) ? gst.GetInt64() : 0;
                     long globalEndTime = fr.TryGetProperty("endTime", out var get) ? get.GetInt64() : globalStartTime;
-                    
+
                     var masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
-                    
+
                     int i = 0;
                     foreach (var fight in fightsArray.EnumerateArray())
                     {
@@ -942,18 +738,45 @@ console.log('__IPC__:' + JSON.stringify({ channel: 'ready', data: {} }));
                                 EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
                                 EventsString = eventsStr
                             };
-                            
+
                             Plugin.Log.Information($"[LiveLog] Uploading: {fightData.Name} (segment {i + 1})");
                             await onFightComplete(masterStr, fightData, i + 1, globalStartTime, globalEndTime);
                         }
                         i++;
                     }
-                    
+
                     return currentCount;
                 }
             }
             return currentCount > lastFightCount ? currentCount : lastFightCount;
         }
         return lastFightCount;
+    }
+
+    /// <summary>
+    /// Host object exposed to JavaScript for IPC message capture.
+    /// Called from JS via __ipc.capture(jsonString).
+    /// </summary>
+    public class IpcHost
+    {
+        private readonly ParserService service;
+
+        public IpcHost(ParserService service) => this.service = service;
+
+        public void capture(string json)
+        {
+            try
+            {
+                var doc = JsonDocument.Parse(json);
+                lock (service.ipcLock)
+                {
+                    service.ipcMessages.Add(doc.RootElement.Clone());
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Debug($"IPC parse error: {ex.Message}");
+            }
+        }
     }
 }
