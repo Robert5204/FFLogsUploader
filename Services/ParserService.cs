@@ -16,6 +16,9 @@ namespace FFLogsPlugin.Services;
 /// <summary>
 /// Manages the FFLogs parser using an embedded V8 JavaScript engine (ClearScript).
 /// No Node.js subprocess required.
+///
+/// Thread safety: All V8 engine calls are serialized through <see cref="engineLock"/>.
+/// The engine must not be accessed concurrently — V8ScriptEngine is single-threaded.
 /// </summary>
 public class ParserService : IDisposable
 {
@@ -48,6 +51,10 @@ public class ParserService : IDisposable
     private readonly List<JsonElement> ipcMessages = new();
     private readonly object ipcLock = new();
 
+    // Serializes all V8 engine access — V8ScriptEngine is not thread-safe
+    private readonly SemaphoreSlim engineLock = new(1, 1);
+    private bool disposed;
+
     // Use the authenticated HttpClient from FFLogsService
     private HttpClient HttpClient => plugin.FFLogsService.HttpClient;
 
@@ -58,7 +65,11 @@ public class ParserService : IDisposable
 
     public void Dispose()
     {
+        if (disposed) return;
+        disposed = true;
+
         StopParser();
+        engineLock.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -78,7 +89,7 @@ public class ParserService : IDisposable
 
     /// <summary>
     /// Ensures the parser bundle is downloaded, validated, and cached.
-    /// The cached bundle now stores only the raw parser + glue code (no Node.js wrapper).
+    /// The cached bundle stores only the raw parser + glue code (no Node.js wrapper).
     /// </summary>
     private async Task EnsureParserAsync()
     {
@@ -203,12 +214,28 @@ public class ParserService : IDisposable
         var sessionStorage = localStorage;
 
         var _timerId = 0;
-        function setTimeout(fn, delay) { var id = ++_timerId; if (typeof fn === 'function') { try { fn(); } catch(e) {} } return id; }
+        var _pendingTimeouts = [];
+        function setTimeout(fn, delay) {
+            var id = ++_timerId;
+            if (typeof fn === 'function') _pendingTimeouts.push(fn);
+            return id;
+        }
         function setInterval() { return ++_timerId; }
         function clearTimeout() {}
         function clearInterval() {}
         var performance = { now: function() { return Date.now(); } };
         function fetch() { throw new Error('fetch not supported'); }
+
+        // Drain deferred callbacks — called from C# after each message dispatch
+        function __drainTimeouts() {
+            var safety = 1000;
+            while (_pendingTimeouts.length > 0 && safety-- > 0) {
+                var batch = _pendingTimeouts.splice(0, _pendingTimeouts.length);
+                for (var i = 0; i < batch.length; i++) {
+                    try { batch[i](); } catch(e) {}
+                }
+            }
+        }
 
         var URLSearchParams = function(init) {
             this._params = {};
@@ -239,6 +266,7 @@ public class ParserService : IDisposable
                 source: { postMessage: function(r) { __ipc.capture(JSON.stringify(r)); } },
                 origin: 'emulator'
             });
+            __drainTimeouts();
         }
     ";
 
@@ -262,6 +290,9 @@ public class ParserService : IDisposable
         var bundleCode = await File.ReadAllTextAsync(parserBundlePath!);
         engine.Execute(bundleCode);
 
+        // Drain any timeouts queued during parser initialization
+        engine.Execute("__drainTimeouts()");
+
         // Verify the parser registered its message listener
         var hasListener = engine.Evaluate("!!window._messageListener");
         if (hasListener is not true)
@@ -271,10 +302,10 @@ public class ParserService : IDisposable
     }
 
     /// <summary>
-    /// Send a message to the parser and collect any IPC responses.
-    /// V8 calls are synchronous, so responses are available immediately after execution.
+    /// Send a message to the parser (fire-and-forget — responses are not collected).
+    /// Must be called while holding <see cref="engineLock"/>, or from a method that does.
     /// </summary>
-    private void SendMessage(object message)
+    private void SendMessageCore(object message)
     {
         if (engine == null)
             throw new InvalidOperationException("Parser engine is not running");
@@ -282,23 +313,50 @@ public class ParserService : IDisposable
         var json = JsonSerializer.Serialize(message);
         Plugin.Log.Debug($"[Parser] Sending: {json[..Math.Min(200, json.Length)]}...");
 
-        lock (ipcLock)
-        {
-            ipcMessages.Clear();
-        }
-
         engine.Execute($"__dispatchMessage({JsonSerializer.Serialize(json)})");
     }
 
     /// <summary>
+    /// Send a message to the parser without collecting responses.
+    /// Thread-safe — acquires the engine lock.
+    /// </summary>
+    private void SendMessage(object message)
+    {
+        engineLock.Wait();
+        try
+        {
+            SendMessageCore(message);
+        }
+        finally
+        {
+            engineLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Send a message and return all IPC responses collected during execution.
+    /// Thread-safe — acquires the engine lock.
     /// </summary>
     private List<JsonElement> SendMessageAndCollect(object message)
     {
-        SendMessage(message);
-        lock (ipcLock)
+        engineLock.Wait();
+        try
         {
-            return new List<JsonElement>(ipcMessages);
+            lock (ipcLock)
+            {
+                ipcMessages.Clear();
+            }
+
+            SendMessageCore(message);
+
+            lock (ipcLock)
+            {
+                return new List<JsonElement>(ipcMessages);
+            }
+        }
+        finally
+        {
+            engineLock.Release();
         }
     }
 
@@ -307,7 +365,7 @@ public class ParserService : IDisposable
     /// Checks both wrapped (data.key) and direct (key) formats.
     /// Returns the unwrapped element containing the key.
     /// </summary>
-    private JsonElement? FindResponseWithKey(List<JsonElement> responses, string key)
+    private static JsonElement? FindResponseWithKey(List<JsonElement> responses, string key)
     {
         foreach (var msg in responses)
         {
@@ -343,8 +401,9 @@ public class ParserService : IDisposable
             // Set report code
             SendMessage(new { message = "set-report-code", id = 0, reportCode });
 
-            // Parse lines
-            SendMessage(new
+            // Parse lines — run on a thread pool thread to avoid blocking the async context
+            // since V8 execution is synchronous and large files can take several seconds
+            await Task.Run(() => SendMessage(new
             {
                 message = "parse-lines",
                 id = 1,
@@ -352,7 +411,7 @@ public class ParserService : IDisposable
                 scanning = false,
                 selectedRegion = regionStr,
                 raidsToUpload = Array.Empty<int>()
-            });
+            }));
 
             // Collect fights
             var fightsResponses = SendMessageAndCollect(new
@@ -529,7 +588,8 @@ public class ParserService : IDisposable
                 if (existingLines.Count > 0)
                 {
                     Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
-                    SendMessage(new
+                    // Initial parse can be large — run on thread pool to avoid blocking
+                    await Task.Run(() => SendMessage(new
                     {
                         message = "parse-lines",
                         id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -537,7 +597,7 @@ public class ParserService : IDisposable
                         scanning = false,
                         selectedRegion = regionStr,
                         raidsToUpload = Array.Empty<object>()
-                    });
+                    }), cancellationToken);
                 }
 
                 if (!uploadPreviousFights)

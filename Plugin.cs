@@ -81,6 +81,11 @@ public sealed class Plugin : IDalamudPlugin
         LoginWindow.Dispose();
         MainWindow.Dispose();
         ParseViewerWindow.Dispose();
+
+        // Stop live logging and wait for it to finish before disposing the parser engine,
+        // otherwise the V8 engine could be disposed while still executing JS.
+        FFLogsService.StopLiveLog();
+        FFLogsService.WaitForLiveLogAsync().GetAwaiter().GetResult();
         ParserService.Dispose();
 
         CommandManager.RemoveHandler(CommandName);

@@ -43,6 +43,7 @@ public class FFLogsService
     public bool IsLiveLogging { get; private set; }
     public int LiveFightCount { get; private set; }
     private CancellationTokenSource? liveLogCts;
+    private Task? liveLogTask;
 
     public FFLogsService(Plugin plugin)
     {
@@ -256,10 +257,10 @@ public class FFLogsService
         LiveFightCount = 0;
         CurrentReportCode = null;
 
-        _ = Task.Run(async () =>
+        liveLogTask = Task.Run(async () =>
         {
             string? reportCode = null;
-            
+
             try
             {
                 await plugin.ParserService.StartLiveLogAsync(logDirectory, region, uploadPreviousFights, async (masterData, fight, segmentId, startTime, endTime) =>
@@ -271,7 +272,7 @@ public class FFLogsService
                         reportCode = await CreateReportAsync("live_log", description, visibility, region, guildId);
                         CurrentReportCode = reportCode;
                     }
-                    
+
                     await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData));
                     await WithRetryAsync(() => UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true));
                     LiveFightCount++;
@@ -297,10 +298,36 @@ public class FFLogsService
                 {
                     Plugin.Log.Information("[LiveLog] Live logging ended. No fights were uploaded.");
                 }
-                
+
                 IsLiveLogging = false;
             }
         });
+    }
+
+    /// <summary>
+    /// Waits for any active live log task to finish. Called during plugin disposal
+    /// to ensure the V8 engine isn't disposed while still in use.
+    /// </summary>
+    public async Task WaitForLiveLogAsync(int timeoutMs = 5000)
+    {
+        if (liveLogTask == null) return;
+
+        // Signal cancellation first
+        liveLogCts?.Cancel();
+
+        // Wait for the task to complete (with timeout to avoid hanging disposal)
+        try
+        {
+            await liveLogTask.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs));
+        }
+        catch (TimeoutException)
+        {
+            Plugin.Log.Warning("[LiveLog] Live log task did not finish within timeout during disposal");
+        }
+        catch (Exception)
+        {
+            // Task already completed with error — that's fine
+        }
     }
 
     private void TrackReportCode(string code)
