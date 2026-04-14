@@ -20,7 +20,7 @@ namespace FFLogsPlugin.Services;
 public class FFLogsService
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
-    private const string CLIENT_VERSION = "8.20.113";
+    private const string CLIENT_VERSION = "9.0.33";
     private const int PARSER_VERSION = 1072;
     private const int MaxRetries = 3;
     
@@ -271,6 +271,10 @@ public class FFLogsService
                         Plugin.Log.Information("[LiveLog] First fight detected - creating report...");
                         reportCode = await CreateReportAsync("live_log", description, visibility, region, guildId);
                         CurrentReportCode = reportCode;
+
+                        // Inform the parser so subsequent collect-master-info calls
+                        // can be validated against the expected report code.
+                        plugin.ParserService.SetReportCode(reportCode);
                     }
 
                     await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData));
@@ -368,7 +372,38 @@ public class FFLogsService
         }
     }
 
-    private async Task UploadMasterTableAsync(string reportCode, string masterTableContent)
+    private static string GenerateWebKitBoundary()
+    {
+        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        var random = new Random();
+        var suffix = new char[16];
+        for (int i = 0; i < suffix.Length; i++)
+            suffix[i] = chars[random.Next(chars.Length)];
+        return $"----WebKitFormBoundary{new string(suffix)}";
+    }
+
+    private static HttpContent CreateStringPart(string name, string value)
+    {
+        var content = new StringContent(value);
+        content.Headers.ContentType = null;
+        content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("form-data")
+        {
+            Name = $"\"{name}\""
+        };
+        return content;
+    }
+
+    private static HttpContent CreateFilePart(string name, string filename, byte[] data)
+    {
+        var content = new ByteArrayContent(data);
+        content.Headers.Clear();
+        // Add headers in exact order to match the official client
+        content.Headers.TryAddWithoutValidation("Content-Disposition", $"form-data; name=\"{name}\"; filename=\"{filename}\"");
+        content.Headers.TryAddWithoutValidation("Content-Type", "application/zip");
+        return content;
+    }
+
+    private async Task UploadMasterTableAsync(string reportCode, string masterTableContent, int segmentId = 1, bool isRealTime = false)
     {
         using var memoryStream = new MemoryStream();
         using (var zipArchive = new System.IO.Compression.ZipArchive(memoryStream, System.IO.Compression.ZipArchiveMode.Create, true))
@@ -380,10 +415,21 @@ public class FFLogsService
         }
 
         var zipBytes = memoryStream.ToArray();
-        using var content = new MultipartFormDataContent();
-        content.Add(new ByteArrayContent(zipBytes), "logfile", "blob");
+        var boundary = GenerateWebKitBoundary();
+        using var content = new MultipartFormDataContent(boundary);
+        
+        content.Add(CreateStringPart("segmentId", segmentId.ToString()));
+        content.Add(CreateStringPart("isRealTime", isRealTime.ToString().ToLower()));
+        content.Add(CreateFilePart("logfile", "blob", zipBytes));
 
-        var response = await HttpClient.PostAsync($"/desktop-client/set-report-master-table/{reportCode}", content);
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"/desktop-client/set-report-master-table/{reportCode}")
+        {
+            Content = content
+        };
+        request.Headers.Accept.Clear();
+        request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+
+        var response = await HttpClient.SendAsync(request);
         response.EnsureSuccessStatusCode();
         
         Plugin.Log.Debug($"Master table uploaded for {reportCode}");
@@ -393,7 +439,7 @@ public class FFLogsService
     {
         // Format events: header + count + events
         var lines = fight.EventsString.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        var content = $"72|1\n{lines.Length}\n{fight.EventsString}";
+        var eventsContent = $"{fight.LogVersion}|{fight.GameVersion}\n{lines.Length}\n{fight.EventsString}";
         
         using var memoryStream = new MemoryStream();
         using (var zipArchive = new System.IO.Compression.ZipArchive(memoryStream, System.IO.Compression.ZipArchiveMode.Create, true))
@@ -401,27 +447,37 @@ public class FFLogsService
             var entry = zipArchive.CreateEntry("log.txt");
             using var entryStream = entry.Open();
             using var writer = new StreamWriter(entryStream);
-            await writer.WriteAsync(content);
+            await writer.WriteAsync(eventsContent);
         }
 
         var zipBytes = memoryStream.ToArray();
         
-        var parameters = new Dictionary<string, object>
+        // Official client sends logfile first, then parameters as a JSON field
+        var parameters = JsonSerializer.Serialize(new
         {
-            ["startTime"] = startTime,
-            ["endTime"] = endTime,
-            ["mythic"] = 0,
-            ["isLiveLog"] = isLive,
-            ["isRealTime"] = isLive,
-            ["inProgressEventCount"] = 0,
-            ["segmentId"] = segmentId
+            startTime,
+            endTime,
+            mythic = 0,
+            isLiveLog = isLive,
+            isRealTime = isLive,
+            inProgressEventCount = 0,
+            segmentId
+        });
+
+        var boundary = GenerateWebKitBoundary();
+        using var formContent = new MultipartFormDataContent(boundary);
+        
+        formContent.Add(CreateFilePart("logfile", "blob", zipBytes));
+        formContent.Add(CreateStringPart("parameters", parameters));
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"/desktop-client/add-report-segment/{reportCode}")
+        {
+            Content = formContent
         };
+        request.Headers.Accept.Clear();
+        request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
 
-        using var formContent = new MultipartFormDataContent();
-        formContent.Add(new ByteArrayContent(zipBytes), "logfile", "blob");
-        formContent.Add(new StringContent(JsonSerializer.Serialize(parameters)), "parameters");
-
-        var response = await HttpClient.PostAsync($"/desktop-client/add-report-segment/{reportCode}", formContent);
+        var response = await HttpClient.SendAsync(request);
         response.EnsureSuccessStatusCode();
         
         Plugin.Log.Debug($"Segment {segmentId} uploaded for {reportCode} (isLive={isLive})");
@@ -455,6 +511,8 @@ public class FightData
     public long StartTime { get; set; }
     public long EndTime { get; set; }
     public string EventsString { get; set; } = string.Empty;
+    public int LogVersion { get; set; } = 72;
+    public int GameVersion { get; set; } = 1;
 }
 
 public class GuildInfo

@@ -50,6 +50,7 @@ public class ParserService : IDisposable
     private V8ScriptEngine? engine;
     private readonly List<JsonElement> ipcMessages = new();
     private readonly object ipcLock = new();
+    private string? currentReportCode;
 
     // Serializes all V8 engine access — V8ScriptEngine is not thread-safe
     private readonly SemaphoreSlim engineLock = new(1, 1);
@@ -85,6 +86,18 @@ public class ParserService : IDisposable
             try { engine.Dispose(); } catch { }
             engine = null;
         }
+        currentReportCode = null;
+    }
+
+    /// <summary>
+    /// Inform the parser of the current report code.
+    /// Called from FFLogsService after a report is created during live logging,
+    /// so that subsequent collect-master-info calls can pass the correct code.
+    /// </summary>
+    public void SetReportCode(string reportCode)
+    {
+        currentReportCode = reportCode;
+        SendMessage(new { message = "set-report-code", id = 0, reportCode });
     }
 
     /// <summary>
@@ -446,6 +459,10 @@ public class ParserService : IDisposable
             // Extract fights
             if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
             {
+                var fr = fightsResult.Value;
+                var logVer = fr.TryGetProperty("logVersion", out var lvProp) ? lvProp.GetInt32() : 72;
+                var gameVer = fr.TryGetProperty("gameVersion", out var gvProp) ? gvProp.GetInt32() : 1;
+
                 foreach (var fight in fightsArray.EnumerateArray())
                 {
                     fights.Add(new FightData
@@ -453,11 +470,12 @@ public class ParserService : IDisposable
                         Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
                         StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
                         EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
-                        EventsString = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : ""
+                        EventsString = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "",
+                        LogVersion = logVer,
+                        GameVersion = gameVer
                     });
                 }
 
-                var fr = fightsResult.Value;
                 startTime = fr.TryGetProperty("startTime", out var st) ? st.GetInt64() : 0;
                 endTime = fr.TryGetProperty("endTime", out var et) ? et.GetInt64() : 0;
             }
@@ -769,11 +787,13 @@ public class ParserService : IDisposable
                 var newCount = currentCount - lastFightCount;
                 Plugin.Log.Information($"[LiveLog] {newCount} NEW fight(s) detected!");
 
-                var masterResponses = SendMessageAndCollect(new
-                {
-                    message = "collect-master-info",
-                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                });
+                // Conditionally pass reportCode to match what set-report-code established.
+                // Before the first report is created, currentReportCode is null and we omit
+                // the field entirely so the JS side sees undefined (matching expectedReportCode).
+                object masterMsg = currentReportCode != null
+                    ? new { message = "collect-master-info", id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), reportCode = currentReportCode }
+                    : (object)new { message = "collect-master-info", id = DateTimeOffset.UtcNow.ToUnixTimeSeconds() };
+                var masterResponses = SendMessageAndCollect(masterMsg);
 
                 var masterResult = FindResponseWithKey(masterResponses, "actorsString");
 
@@ -782,6 +802,8 @@ public class ParserService : IDisposable
                     var fr = fightsResult.Value;
                     long globalStartTime = fr.TryGetProperty("startTime", out var gst) ? gst.GetInt64() : 0;
                     long globalEndTime = fr.TryGetProperty("endTime", out var get) ? get.GetInt64() : globalStartTime;
+                    var logVer = fr.TryGetProperty("logVersion", out var lvProp) ? lvProp.GetInt32() : 72;
+                    var gameVer = fr.TryGetProperty("gameVersion", out var gvProp) ? gvProp.GetInt32() : 1;
 
                     var masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
 
@@ -796,7 +818,9 @@ public class ParserService : IDisposable
                                 Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
                                 StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
                                 EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
-                                EventsString = eventsStr
+                                EventsString = eventsStr,
+                                LogVersion = logVer,
+                                GameVersion = gameVer
                             };
 
                             Plugin.Log.Information($"[LiveLog] Uploading: {fightData.Name} (segment {i + 1})");
