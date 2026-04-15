@@ -9,7 +9,8 @@ public enum FFLogsRegion
     EU = 2,
     JP = 3,
     CN = 4,
-    KR = 5
+    KR = 5,
+    OC = 6
 }
 
 public static class FFLogsRegionExtensions
@@ -24,11 +25,12 @@ public static class FFLogsRegionExtensions
         FFLogsRegion.JP => "JP",
         FFLogsRegion.CN => "CN",
         FFLogsRegion.KR => "KR",
+        FFLogsRegion.OC => "OC",
         _ => "NA"
     };
 
     /// <summary>
     /// Display names for UI combo boxes, indexed by (int)region - 1.
     /// </summary>
-    public static readonly string[] DisplayNames = { "NA", "EU", "JP", "CN", "KR" };
+    public static readonly string[] DisplayNames = { "NA", "EU", "JP", "CN", "KR", "OC" };
 }
