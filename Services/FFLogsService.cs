@@ -229,11 +229,15 @@ public class FFLogsService
         // 2. Process log with parser
         var (masterData, fights, startTime, endTime) = await plugin.ParserService.ProcessLogAsync(logPath, reportCode, region);
 
-        // 3. Upload each fight segment (with master table before each)
+        // 3. Upload each fight segment (with master table before each).
+        // endTime is per-fight (global start + last event relative time) so each
+        // segment has distinct boundaries on the server — matches official client.
         for (int i = 0; i < fights.Count; i++)
         {
-            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData));
-            await WithRetryAsync(() => UploadSegmentAsync(reportCode, fights[i], i + 1, startTime, endTime));
+            int segmentId = i + 1;
+            long fightEndTime = ComputeFightEndTime(startTime, fights[i].EventsString, endTime);
+            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData, segmentId));
+            await WithRetryAsync(() => UploadSegmentAsync(reportCode, fights[i], segmentId, startTime, fightEndTime));
         }
 
         // 4. Terminate the report
@@ -277,7 +281,7 @@ public class FFLogsService
                         plugin.ParserService.SetReportCode(reportCode);
                     }
 
-                    await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData));
+                    await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData, segmentId));
                     await WithRetryAsync(() => UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true));
                     LiveFightCount++;
                 }, liveLogCts.Token);
@@ -382,6 +386,35 @@ public class FFLogsService
         return $"----WebKitFormBoundary{new string(suffix)}";
     }
 
+    /// <summary>
+    /// Computes a per-fight endTime as globalStart + last-event relative time, parsed
+    /// from the fight's eventsString buffer. Falls back to <paramref name="fallback"/>
+    /// if the buffer contains no parseable event rows.
+    /// </summary>
+    private static long ComputeFightEndTime(long globalStart, string eventsString, long fallback)
+    {
+        if (string.IsNullOrEmpty(eventsString)) return fallback;
+
+        int end = eventsString.Length;
+        while (end > 0 && (eventsString[end - 1] == '\n' || eventsString[end - 1] == '\r'))
+            end--;
+        if (end == 0) return fallback;
+
+        int firstNewline = eventsString.IndexOf('\n');
+        int secondNewline = firstNewline >= 0 ? eventsString.IndexOf('\n', firstNewline + 1) : -1;
+        if (secondNewline < 0) return fallback;
+
+        int lineStart = eventsString.LastIndexOf('\n', end - 1) + 1;
+        if (lineStart <= secondNewline) return fallback;
+
+        int pipe = eventsString.IndexOf('|', lineStart, end - lineStart);
+        if (pipe < 0) return fallback;
+
+        return long.TryParse(eventsString.AsSpan(lineStart, pipe - lineStart), out var rel)
+            ? globalStart + rel
+            : fallback;
+    }
+
     private static HttpContent CreateStringPart(string name, string value)
     {
         var content = new StringContent(value);
@@ -417,7 +450,11 @@ public class FFLogsService
         var zipBytes = memoryStream.ToArray();
         var boundary = GenerateWebKitBoundary();
         using var content = new MultipartFormDataContent(boundary);
-        
+        // .NET quotes the boundary by default; the FFLogs server expects an
+        // unquoted boundary (matching the official Electron uploader).
+        content.Headers.Remove("Content-Type");
+        content.Headers.TryAddWithoutValidation("Content-Type", $"multipart/form-data; boundary={boundary}");
+
         content.Add(CreateStringPart("segmentId", segmentId.ToString()));
         content.Add(CreateStringPart("isRealTime", isRealTime.ToString().ToLower()));
         content.Add(CreateFilePart("logfile", "blob", zipBytes));
@@ -459,14 +496,18 @@ public class FFLogsService
             endTime,
             mythic = 0,
             isLiveLog = isLive,
-            isRealTime = isLive,
+            isRealTime = false,
             inProgressEventCount = 0,
             segmentId
         });
 
         var boundary = GenerateWebKitBoundary();
         using var formContent = new MultipartFormDataContent(boundary);
-        
+        // .NET quotes the boundary by default; the FFLogs server expects an
+        // unquoted boundary (matching the official Electron uploader).
+        formContent.Headers.Remove("Content-Type");
+        formContent.Headers.TryAddWithoutValidation("Content-Type", $"multipart/form-data; boundary={boundary}");
+
         formContent.Add(CreateFilePart("logfile", "blob", zipBytes));
         formContent.Add(CreateStringPart("parameters", parameters));
 

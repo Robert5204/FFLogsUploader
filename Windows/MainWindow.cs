@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -14,8 +15,8 @@ namespace FFLogsPlugin.Windows;
 public class MainWindow : Window, IDisposable
 {
     private readonly Plugin plugin;
-    private FileDialog? fileDialog;
-    private bool isSelectingFolder = false;
+
+    private readonly FileDialogManager fileDialogManager = new();
 
     private string logPath = string.Empty;
     private int selectedGuildIndex = 0;
@@ -63,7 +64,7 @@ public class MainWindow : Window, IDisposable
             }
         }
 
-        selectedRegion = Math.Max(0, plugin.Configuration.Region - 1);
+        selectedRegion = FFLogsRegionExtensions.ApiValueToComboIndex(plugin.Configuration.Region);
         selectedVisibility = plugin.Configuration.Visibility;
     }
 
@@ -71,50 +72,8 @@ public class MainWindow : Window, IDisposable
 
     public override void Draw()
     {
-        // Handle file dialog
-        if (fileDialog != null)
-        {
-            try
-            {
-                if (fileDialog.Draw())
-                {
-                    if (fileDialog.GetIsOk())
-                    {
-                        var results = fileDialog.GetResults();
-                        if (results != null && results.Count > 0)
-                        {
-                            logPath = isSelectingFolder ? fileDialog.GetCurrentPath() : results[0];
-                        }
-                    }
-                    fileDialog = null;
-                }
-            }
-            catch (NullReferenceException)
-            {
-                // Dalamud's ImGuiFileDialog throws NullReferenceException in
-                // AddFileNameInSelection when double-clicking a file. The selection
-                // path is still valid at this point, so extract it and close the dialog.
-                try
-                {
-                    var currentPath = fileDialog!.GetCurrentPath();
-                    var results = fileDialog.GetResults();
-                    if (results != null && results.Count > 0)
-                    {
-                        logPath = isSelectingFolder ? currentPath : results[0];
-                    }
-                    else if (!string.IsNullOrEmpty(currentPath))
-                    {
-                        logPath = currentPath;
-                    }
-                }
-                catch
-                {
-                    // If even recovery fails, just close the dialog silently
-                }
-                fileDialog = null;
-            }
-        }
-        
+        fileDialogManager.Draw();
+
         DrawHeader();
         ImGui.Separator();
 
@@ -161,21 +120,16 @@ public class MainWindow : Window, IDisposable
         ImGui.SameLine();
         if (ImGui.Button("Browse##dir"))
         {
-            isSelectingFolder = true;
-            fileDialog = new FileDialog(
-                "SelectLogFolder",
-                "Select Log Folder",
-                string.Empty,
-                GetDialogStartPath(),
-                string.Empty,
-                string.Empty,
-                1,
-                false,
-                ImGuiFileDialogFlags.SelectOnly
-            );
-            fileDialog.Show();
+            fileDialogManager.OpenFolderDialog(
+                "Select Log Directory",
+                (success, path) =>
+                {
+                    if (success && !string.IsNullOrEmpty(path))
+                        logPath = path;
+                },
+                GetDialogStartPath());
         }
-        
+
         if (plugin.FFLogsService.IsLiveLogging)
             ImGui.EndDisabled();
 
@@ -245,19 +199,16 @@ public class MainWindow : Window, IDisposable
         ImGui.SameLine();
         if (ImGui.Button("Browse##file"))
         {
-            isSelectingFolder = false;
-            fileDialog = new FileDialog(
-                "SelectLogFile",
+            fileDialogManager.OpenFileDialog(
                 "Select Log File",
-                ".log,.txt",
-                GetDialogStartPath(),
-                string.Empty,
-                string.Empty,
+                "Log files{.log},All files{.*}",
+                (success, paths) =>
+                {
+                    if (success && paths.Count > 0)
+                        logPath = paths[0];
+                },
                 1,
-                false,
-                ImGuiFileDialogFlags.SelectOnly
-            );
-            fileDialog.Show();
+                GetDialogStartPath());
         }
 
         ImGui.Spacing();
@@ -393,7 +344,7 @@ public class MainWindow : Window, IDisposable
         try
         {
             var guildId = GetSelectedGuildId();
-            await plugin.FFLogsService.StartLiveLogAsync(logPath, selectedRegion + 1, selectedVisibility, guildId, description, uploadPreviousFights);
+            await plugin.FFLogsService.StartLiveLogAsync(logPath, FFLogsRegionExtensions.ComboIndexToApiValue(selectedRegion), selectedVisibility, guildId, description, uploadPreviousFights);
         }
         catch (Exception ex)
         {
@@ -433,7 +384,7 @@ public class MainWindow : Window, IDisposable
         try
         {
             var guildId = GetSelectedGuildId();
-            var reportCode = await plugin.FFLogsService.UploadLogAsync(logPath, selectedRegion + 1, selectedVisibility, guildId, description);
+            var reportCode = await plugin.FFLogsService.UploadLogAsync(logPath, FFLogsRegionExtensions.ComboIndexToApiValue(selectedRegion), selectedVisibility, guildId, description);
             statusMessage = $"Upload complete! Report: {reportCode}";
         }
         catch (Exception ex)
@@ -456,7 +407,7 @@ public class MainWindow : Window, IDisposable
         }
         
         plugin.Configuration.LogDirectory = directoryToSave;
-        plugin.Configuration.Region = selectedRegion + 1;
+        plugin.Configuration.Region = FFLogsRegionExtensions.ComboIndexToApiValue(selectedRegion);
         plugin.Configuration.Visibility = selectedVisibility;
         plugin.Configuration.Save();
     }

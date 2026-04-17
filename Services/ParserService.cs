@@ -29,6 +29,9 @@ public class ParserService : IDisposable
     private const int FightEndDelayMs = 5000;
     private const int FileCheckIntervalSeconds = 10;
 
+    // Wipe director code — distinct from phase-transition codes; triggers call-wipe
+    private const string WipeDirectorCode = "40000011";
+
     // Parser page query parameters
     private const string ParserMetersEnabled = "false";
     private const string ParserLiveFightDataEnabled = "false";
@@ -324,7 +327,8 @@ public class ParserService : IDisposable
             throw new InvalidOperationException("Parser engine is not running");
 
         var json = JsonSerializer.Serialize(message);
-        Plugin.Log.Debug($"[Parser] Sending: {json[..Math.Min(200, json.Length)]}...");
+        if (!json.StartsWith("{\"message\":\"parse-lines\""))
+            Plugin.Log.Debug($"[Parser] Sending: {json[..Math.Min(200, json.Length)]}...");
 
         engine.Execute($"__dispatchMessage({JsonSerializer.Serialize(json)})");
     }
@@ -416,15 +420,7 @@ public class ParserService : IDisposable
 
             // Parse lines — run on a thread pool thread to avoid blocking the async context
             // since V8 execution is synchronous and large files can take several seconds
-            await Task.Run(() => SendMessage(new
-            {
-                message = "parse-lines",
-                id = 1,
-                lines,
-                scanning = false,
-                selectedRegion = regionStr,
-                raidsToUpload = Array.Empty<int>()
-            }));
+            await Task.Run(() => SendParseLines(new List<string>(lines), regionStr, 0));
 
             // Collect fights
             var fightsResponses = SendMessageAndCollect(new
@@ -463,9 +459,10 @@ public class ParserService : IDisposable
                 var logVer = fr.TryGetProperty("logVersion", out var lvProp) ? lvProp.GetInt32() : 72;
                 var gameVer = fr.TryGetProperty("gameVersion", out var gvProp) ? gvProp.GetInt32() : 1;
 
+                int bulkIdx = 0;
                 foreach (var fight in fightsArray.EnumerateArray())
                 {
-                    fights.Add(new FightData
+                    var fd = new FightData
                     {
                         Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
                         StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
@@ -473,7 +470,10 @@ public class ParserService : IDisposable
                         EventsString = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "",
                         LogVersion = logVer,
                         GameVersion = gameVer
-                    });
+                    };
+                    fights.Add(fd);
+                    LogFightDiagnostic("BULK", bulkIdx + 1, fd, fight);
+                    bulkIdx++;
                 }
 
                 startTime = fr.TryGetProperty("startTime", out var st) ? st.GetInt64() : 0;
@@ -547,6 +547,125 @@ public class ParserService : IDisposable
     }
 
     /// <summary>
+    /// Extracts the last event's relative timestamp (first pipe field) from an
+    /// eventsString buffer ("73|1\n{count}\n{ts}|..."). Returns false if the
+    /// buffer contains no event rows — used to skip empty fights produced by a
+    /// force-push when nothing was actually recorded.
+    /// </summary>
+    private static bool TryGetLastEventRelativeTime(string eventsString, out long lastRelativeMs)
+    {
+        lastRelativeMs = 0;
+        if (string.IsNullOrEmpty(eventsString)) return false;
+
+        int end = eventsString.Length;
+        while (end > 0 && (eventsString[end - 1] == '\n' || eventsString[end - 1] == '\r'))
+            end--;
+        if (end == 0) return false;
+
+        int lineStart = eventsString.LastIndexOf('\n', end - 1) + 1;
+        int pipe = eventsString.IndexOf('|', lineStart, end - lineStart);
+        if (pipe < 0) return false;
+
+        // Skip header line ("73|1") and count line — both precede any event row.
+        // The header line's first field is the log version (2-digit), which still
+        // parses as a number but we reject it by requiring the count-line separator.
+        int firstNewline = eventsString.IndexOf('\n');
+        int secondNewline = firstNewline >= 0 ? eventsString.IndexOf('\n', firstNewline + 1) : -1;
+        if (secondNewline < 0 || lineStart <= secondNewline) return false;
+
+        return long.TryParse(eventsString.AsSpan(lineStart, pipe - lineStart), out lastRelativeMs);
+    }
+
+    /// <summary>
+    /// Dumps a fight's identifying fields so we can diff a bulk-upload run against a
+    /// bulk/live run for the same log. If the server-side result differs across runs
+    /// but this dump is identical, the bug is upload-side (or server-side merging);
+    /// if this dump differs, the parser produced different output for the two paths.
+    /// </summary>
+    private static void LogFightDiagnostic(string tag, int segmentIndex, FightData fd, JsonElement rawFight)
+    {
+        long? dungeonId = null, dungeonPullId = null;
+        string? boss = null, dungeonName = null;
+        int? lastPhase = null;
+        bool? kill = null;
+
+        if (rawFight.TryGetProperty("boss", out var bossEl) && bossEl.ValueKind == JsonValueKind.String)
+            boss = bossEl.GetString();
+        if (rawFight.TryGetProperty("dungeonId", out var dId) && dId.ValueKind == JsonValueKind.Number)
+            dungeonId = dId.GetInt64();
+        if (rawFight.TryGetProperty("dungeonPullId", out var dpId) && dpId.ValueKind == JsonValueKind.Number)
+            dungeonPullId = dpId.GetInt64();
+        if (rawFight.TryGetProperty("dungeonName", out var dn) && dn.ValueKind == JsonValueKind.String)
+            dungeonName = dn.GetString();
+        if (rawFight.TryGetProperty("lastPhase", out var lp) && lp.ValueKind == JsonValueKind.Number)
+            lastPhase = lp.GetInt32();
+        if (rawFight.TryGetProperty("kill", out var k) && (k.ValueKind == JsonValueKind.True || k.ValueKind == JsonValueKind.False))
+            kill = k.GetBoolean();
+
+        var events = fd.EventsString ?? "";
+        var evLen = events.Length;
+        var evHead = evLen > 0 ? events[..Math.Min(160, evLen)].Replace('\n', ' ') : "";
+        var evTail = evLen > 160 ? events[Math.Max(0, evLen - 160)..].Replace('\n', ' ') : "";
+        int evLineCount = 0;
+        for (int i = 0; i < evLen; i++) if (events[i] == '\n') evLineCount++;
+
+        Plugin.Log.Information(
+            $"[{tag}] Fight#{segmentIndex} name={fd.Name} start={fd.StartTime} end={fd.EndTime} " +
+            $"dur={fd.EndTime - fd.StartTime}ms boss={boss} dungeonId={dungeonId} " +
+            $"pullId={dungeonPullId} dungeonName={dungeonName} lastPhase={lastPhase} kill={kill} " +
+            $"eventsLen={evLen} eventsLineCount={evLineCount}");
+        Plugin.Log.Information($"[{tag}] Fight#{segmentIndex} eventsHead: {evHead}");
+        if (evTail.Length > 0)
+            Plugin.Log.Information($"[{tag}] Fight#{segmentIndex} eventsTail: {evTail}");
+    }
+
+    /// <summary>
+    /// Send a batch of lines to the parser with cumulative byte position.
+    /// The official FFLogs uploader always passes logFilePosition — the parser
+    /// uses it internally for per-encounter state tracking.
+    /// </summary>
+    private void SendParseLines(List<string> lines, string regionStr, long position)
+    {
+        SendMessage(new
+        {
+            message = "parse-lines",
+            id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            lines,
+            scanning = false,
+            selectedRegion = regionStr,
+            raidsToUpload = Array.Empty<object>(),
+            logFilePosition = position
+        });
+    }
+
+    private void SendCallWipe()
+    {
+        SendMessage(new { message = "call-wipe", id = 0 });
+    }
+
+    private void SendSetLiveLoggingStartTime(long startTimeMs)
+    {
+        SendMessage(new { message = "set-live-logging-start-time", id = 0, startTime = startTimeMs });
+    }
+
+    /// <summary>
+    /// Extract the leading timestamp from an FFXIV ACT log line ("nn|YYYY-MM-DDTHH:MM:SS...-HH:MM|...").
+    /// Returns null when the field can't be parsed.
+    /// </summary>
+    private static DateTimeOffset? TryParseLineTime(string line)
+    {
+        var first = line.IndexOf('|');
+        if (first < 0) return null;
+        var second = line.IndexOf('|', first + 1);
+        if (second < 0) return null;
+        var ts = line.Substring(first + 1, second - first - 1);
+        if (DateTimeOffset.TryParse(ts, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal, out var dto))
+            return dto;
+        return null;
+    }
+
+    /// <summary>
     /// Start live logging — monitors the latest log file and uploads fights as they complete.
     /// </summary>
     public async Task StartLiveLogAsync(
@@ -584,13 +703,12 @@ public class ParserService : IDisposable
             if (files.Length == 0)
                 throw new Exception("No log files found in directory");
 
-            var logPath = files.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
+            string logPath = files.OrderByDescending(f => File.GetLastWriteTimeUtc(f)).First();
             Plugin.Log.Information($"[LiveLog] Monitoring: {Path.GetFileName(logPath)}");
 
             var regionStr = ((FFLogsRegion)region).ToCode();
 
             int lastFightCount = 0;
-            DateTime lastActivityTime = DateTime.UtcNow;
             DateTime lastFileCheckTime = DateTime.UtcNow;
             bool checkPending = false;
             long lastPosition = 0;
@@ -598,87 +716,87 @@ public class ParserService : IDisposable
             bool fightEndDetected = false;
             DateTime fightEndDetectedTime = DateTime.MinValue;
 
-            // Always parse existing file content so the parser has context
+            // Parse existing file content so the parser has context.
+            var (existingLines, endPos) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, 0);
+            lastPosition = endPos;
+
+            if (existingLines.Count > 0)
             {
-                var (existingLines, endPos) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, 0);
-                lastPosition = endPos;
-
-                if (existingLines.Count > 0)
+                // set-live-logging-start-time must use the log's own first
+                // timestamp, not Date.now(). Using "now" makes the parser treat
+                // all historical events as outside the live window → 0 fights.
+                foreach (var line in existingLines)
                 {
-                    Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
-                    // Initial parse can be large — run on thread pool to avoid blocking
-                    await Task.Run(() => SendMessage(new
+                    var ts = TryParseLineTime(line);
+                    if (ts.HasValue)
                     {
-                        message = "parse-lines",
-                        id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        lines = existingLines,
-                        scanning = false,
-                        selectedRegion = regionStr,
-                        raidsToUpload = Array.Empty<object>()
-                    }), cancellationToken);
-                }
-
-                if (!uploadPreviousFights)
-                {
-                    var responses = SendMessageAndCollect(new
-                    {
-                        message = "collect-fights",
-                        id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        pushFightIfNeeded = true,
-                        scanningOnly = false
-                    });
-
-                    var existingFights = FindResponseWithKey(responses, "fights");
-                    if (existingFights.HasValue && existingFights.Value.TryGetProperty("fights", out var fa))
-                    {
-                        lastFightCount = fa.GetArrayLength();
-                        Plugin.Log.Information($"[LiveLog] Skipping {lastFightCount} existing fight(s)");
+                        var liveStartMs = ts.Value.ToUnixTimeMilliseconds();
+                        SendSetLiveLoggingStartTime(liveStartMs);
+                        Plugin.Log.Debug($"[LiveLog] set-live-logging-start-time: {liveStartMs} (from first log line)");
+                        break;
                     }
-
-                    firstPass = false;
                 }
+
+                Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
+                await Task.Run(() => SendParseLines(existingLines, regionStr, 0), cancellationToken);
             }
+
+            if (!uploadPreviousFights)
+            {
+                // pushFightIfNeeded MUST be false here: forcing a push during the
+                // initial catch-up commits whatever partial buffer the parser holds
+                // (e.g. post-phase debuff ticks in an ultimate), creating a phantom
+                // "Unknown" fight that inflates lastFightCount and causes subsequent
+                // real pulls to appear as non-new.
+                var responses = SendMessageAndCollect(new
+                {
+                    message = "collect-fights",
+                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    pushFightIfNeeded = false,
+                    scanningOnly = false
+                });
+
+                var existingFights = FindResponseWithKey(responses, "fights");
+                if (existingFights.HasValue && existingFights.Value.TryGetProperty("fights", out var fa))
+                {
+                    lastFightCount = fa.GetArrayLength();
+                    Plugin.Log.Information($"[LiveLog] Skipping {lastFightCount} existing fight(s)");
+                }
+
+                firstPass = false;
+            }
+
+            // call-wipe must only fire for truly live lines — never for historical
+            // catch-up reads. The parser already processes wipe events internally
+            // during parse-lines; sending call-wipe retroactively stamps them with
+            // Date.now() (real clock), corrupting fight bookkeeping. We flip this
+            // flag once we've caught up with the file (first read returning 0 lines).
+            bool livePhaseReady = false;
 
             // Main loop
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
-                    // Read new lines from log file
+                    // Read new lines from log file. batchStartPosition captured before
+                    // the read is the pre-batch file position passed as logFilePosition.
+                    long batchStartPosition = lastPosition;
                     var (newLines, newPosition) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, lastPosition);
                     lastPosition = newPosition;
 
                     if (newLines.Count > 0)
                     {
                         Plugin.Log.Debug($"[LiveLog] Read {newLines.Count} new lines (pos={lastPosition})");
-                        lastActivityTime = DateTime.UtcNow;
                         checkPending = false;
 
-                        // Send lines to parser
-                        SendMessage(new
-                        {
-                            message = "parse-lines",
-                            id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                            lines = newLines,
-                            scanning = false,
-                            selectedRegion = regionStr,
-                            raidsToUpload = Array.Empty<object>()
-                        });
-
-                        // Scan for fight-end Director commands
-                        if (!fightEndDetected)
-                        {
-                            foreach (var line in newLines)
-                            {
-                                if (line.StartsWith("33|") && FightEndDirectorCodes.Any(code => line.Contains($"|{code}|")))
-                                {
-                                    Plugin.Log.Information($"[LiveLog] Fight end detected (Director): {line[..Math.Min(80, line.Length)]}");
-                                    fightEndDetected = true;
-                                    fightEndDetectedTime = DateTime.UtcNow;
-                                    break;
-                                }
-                            }
-                        }
+                        SendParseLines(newLines, regionStr, batchStartPosition);
+                        foreach (var line in newLines)
+                            HandleDirectorLine(line, ref fightEndDetected, ref fightEndDetectedTime, sendCallWipe: livePhaseReady);
+                    }
+                    else if (!livePhaseReady)
+                    {
+                        livePhaseReady = true;
+                        Plugin.Log.Information("[LiveLog] Caught up with file — live phase started, call-wipe now active");
                     }
 
                     // Check for a newer log file periodically
@@ -695,20 +813,13 @@ public class ParserService : IDisposable
                                 if (remainingLines.Count > 0)
                                 {
                                     Plugin.Log.Information($"[LiveLog] Reading {remainingLines.Count} remaining lines from old file before switching");
-                                    SendMessage(new
-                                    {
-                                        message = "parse-lines",
-                                        id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                                        lines = remainingLines,
-                                        scanning = false,
-                                        selectedRegion = regionStr,
-                                        raidsToUpload = Array.Empty<object>()
-                                    });
+                                    SendParseLines(remainingLines, regionStr, lastPosition);
                                 }
 
                                 Plugin.Log.Information($"[LiveLog] Switching to newer log file: {Path.GetFileName(newestFile)}");
                                 logPath = newestFile;
                                 lastPosition = 0;
+                                livePhaseReady = false;
                             }
                         }
                     }
@@ -728,7 +839,12 @@ public class ParserService : IDisposable
                         else
                             Plugin.Log.Information($"[LiveLog] Fight end confirmed - pushing completed fight");
 
-                        lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: true);
+                        // pushFightIfNeeded MUST be false mid-loop: in multi-phase ultimate
+                        // fights (e.g. DSR), phase-transition director codes (40000005) fire
+                        // our fight-end detector repeatedly. Forcing a push at those points
+                        // commits a tiny garbage buffer as a phantom "Unknown" fight.
+                        // The parser commits real fights naturally — we just poll for them.
+                        lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: false);
                     }
 
                     await Task.Delay(LiveLogPollIntervalMs, cancellationToken);
@@ -763,6 +879,36 @@ public class ParserService : IDisposable
         finally
         {
             StopParser();
+        }
+    }
+
+    /// <summary>
+    /// Inspect a log line for director commands. Triggers fight-end detection for any
+    /// known end code. When <paramref name="sendCallWipe"/> is true, additionally signals
+    /// call-wipe on the explicit wipe code (40000011) — matches official-client behavior.
+    /// </summary>
+    private void HandleDirectorLine(string line, ref bool fightEndDetected, ref DateTime fightEndDetectedTime, bool sendCallWipe)
+    {
+        if (!line.StartsWith("33|")) return;
+
+        if (sendCallWipe && line.Contains($"|{WipeDirectorCode}|"))
+        {
+            Plugin.Log.Information($"[LiveLog] Wipe director seen — sending call-wipe");
+            SendCallWipe();
+        }
+
+        if (!fightEndDetected)
+        {
+            foreach (var code in FightEndDirectorCodes)
+            {
+                if (line.Contains($"|{code}|"))
+                {
+                    Plugin.Log.Information($"[LiveLog] Fight end detected (Director {code})");
+                    fightEndDetected = true;
+                    fightEndDetectedTime = DateTime.UtcNow;
+                    break;
+                }
+            }
         }
     }
 
@@ -813,6 +959,13 @@ public class ParserService : IDisposable
                         if (i >= lastFightCount)
                         {
                             var eventsStr = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "";
+                            if (!TryGetLastEventRelativeTime(eventsStr, out long lastRel))
+                            {
+                                Plugin.Log.Information($"[LiveLog] Skipping empty fight segment {i + 1} (no events)");
+                                i++;
+                                continue;
+                            }
+                            long fightEndTime = globalStartTime + lastRel;
                             var fightData = new FightData
                             {
                                 Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
@@ -824,7 +977,8 @@ public class ParserService : IDisposable
                             };
 
                             Plugin.Log.Information($"[LiveLog] Uploading: {fightData.Name} (segment {i + 1})");
-                            await onFightComplete(masterStr, fightData, i + 1, globalStartTime, globalEndTime);
+                            LogFightDiagnostic("LIVE", i + 1, fightData, fight);
+                            await onFightComplete(masterStr, fightData, i + 1, globalStartTime, fightEndTime);
                         }
                         i++;
                     }

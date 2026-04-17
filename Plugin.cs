@@ -93,6 +93,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnCommand(string command, string args)
     {
+        
         if (FFLogsService.IsLoggedIn)
             MainWindow.Toggle();
         else
