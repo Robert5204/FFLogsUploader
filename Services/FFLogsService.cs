@@ -21,7 +21,7 @@ public class FFLogsService
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
     private const string CLIENT_VERSION = "9.0.33";
-    private const int PARSER_VERSION = 1072;
+    private const int PARSER_VERSION = 1074;
     private const int MaxRetries = 3;
     
     private readonly Plugin plugin;
