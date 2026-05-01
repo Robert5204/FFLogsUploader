@@ -395,16 +395,26 @@ public class ParserService : IDisposable
     }
 
     /// <summary>
-    /// Process a log file using the embedded V8 parser.
+    /// One uploadable fight: events + the slim per-fight master table that scopes only
+    /// to that fight's actors/abilities. Matches the official client's per-segment upload.
     /// </summary>
-    public async Task<(string masterData, List<FightData> fights, long startTime, long endTime)> ProcessLogAsync(string logPath, string reportCode, int region)
+    public record FightUpload(string MasterTable, FightData Fight, long FightStartTime, long FightEndTime);
+
+    /// <summary>
+    /// Process a log file using the embedded V8 parser.
+    ///
+    /// Mirrors the official client's two-pass flow: a scanning pass discovers raid
+    /// time-windows, then each raid is re-parsed in isolation with raidsToUpload set
+    /// to that single raid. The parser scopes its master table to the raid's
+    /// actors/abilities, producing a slim per-fight master that matches what the
+    /// official uploader sends. A single cumulative master table (the previous flow)
+    /// causes FFLogs to flag the report as "outdated logger".
+    /// </summary>
+    public async Task<List<FightUpload>> ProcessLogAsync(string logPath, string reportCode, int region)
     {
         await StartParserAsync();
 
-        var fights = new List<FightData>();
-        long startTime = 0;
-        long endTime = 0;
-        string masterStr = "";
+        var uploads = new List<FightUpload>();
 
         try
         {
@@ -414,84 +424,156 @@ public class ParserService : IDisposable
             Plugin.Log.Debug($"[Parser] Read {lines.Length} lines");
 
             var regionStr = ((FFLogsRegion)region).ToCode();
+            var lineList = new List<string>(lines);
 
-            // Set report code
+            // Pull a calendar date out of the first line that has one — used by every pass.
+            long? startDateMs = null;
+            foreach (var line in lines)
+            {
+                var ts = TryParseLineTime(line);
+                if (ts.HasValue)
+                {
+                    startDateMs = ts.Value.ToUnixTimeMilliseconds();
+                    break;
+                }
+            }
+
+            // ── Pass 1: scan to discover raids ─────────────────────────────────────
             SendMessage(new { message = "set-report-code", id = 0, reportCode });
+            if (startDateMs.HasValue) SendSetStartDate(startDateMs.Value);
 
-            // Parse lines — run on a thread pool thread to avoid blocking the async context
-            // since V8 execution is synchronous and large files can take several seconds
-            await Task.Run(() => SendParseLines(new List<string>(lines), regionStr, 0));
+            await Task.Run(() => SendParseLines(lineList, regionStr, 0,
+                scanning: true, raidsToUpload: Array.Empty<object>()));
 
-            // Collect fights
-            var fightsResponses = SendMessageAndCollect(new
+            var scannedResponses = SendMessageAndCollect(new
             {
-                message = "collect-fights",
-                id = 2,
-                pushFightIfNeeded = false,
-                scanningOnly = false
+                message = "collect-scanned-raids",
+                id = 1
             });
 
-            var fightsResult = FindResponseWithKey(fightsResponses, "fights");
-
-            if (fightsResult.HasValue)
+            var scannedRaidsElement = FindResponseByChannel(scannedResponses, "collect-scanned-raids-completed");
+            if (!scannedRaidsElement.HasValue || scannedRaidsElement.Value.ValueKind != JsonValueKind.Array)
             {
-                Plugin.Log.Debug($"[Parser] Got fights result with {(fightsResult.Value.TryGetProperty("fights", out var f) ? f.GetArrayLength() : 0)} fights");
-            }
-            else
-            {
-                Plugin.Log.Warning("[Parser] No fights result received!");
+                Plugin.Log.Warning("[Parser] No scanned raids in response — log may contain no fights");
+                return uploads;
             }
 
-            // Collect master info
-            var masterResponses = SendMessageAndCollect(new
-            {
-                message = "collect-master-info",
-                id = 3,
-                reportCode
-            });
+            var rawScanned = scannedRaidsElement.Value;
+            int raidCount = rawScanned.GetArrayLength();
+            Plugin.Log.Information($"[Parser] Scan found {raidCount} raid(s)");
 
-            var masterResult = FindResponseWithKey(masterResponses, "actorsString");
+            if (raidCount == 0) return uploads;
 
-            // Extract fights
-            if (fightsResult.HasValue && fightsResult.Value.TryGetProperty("fights", out var fightsArray))
+            // Snapshot each scanned raid as a JSON string so we can pass it back to the
+            // parser via raidsToUpload after clear-state — we can't hold JsonElement
+            // references across SendMessageAndCollect calls because the underlying
+            // ipcMessages list gets cleared.
+            var scannedRaidJson = new List<string>(raidCount);
+            foreach (var raid in rawScanned.EnumerateArray())
+                scannedRaidJson.Add(raid.GetRawText());
+
+            // ── Pass 2: per-raid replay with raidsToUpload filter ──────────────────
+            // For each raid, clear-state, re-set report code + start date (clear-state
+            // wipes them), re-parse the full file with raidsToUpload=[that_raid].
+            // The parser scopes its master table to that raid's events only.
+            for (int raidIdx = 0; raidIdx < scannedRaidJson.Count; raidIdx++)
             {
+                Plugin.Log.Debug($"[Parser] Replaying raid {raidIdx + 1}/{scannedRaidJson.Count}");
+
+                SendMessageAndCollect(new { message = "clear-state", id = 100 + raidIdx });
+                SendMessage(new { message = "set-report-code", id = 0, reportCode });
+                if (startDateMs.HasValue) SendSetStartDate(startDateMs.Value);
+
+                // raidsToUpload is a single-element JSON array containing the scanned raid
+                // verbatim — the parser only reads .start and .end for time-window filtering.
+                var raidsToUploadJson = $"[{scannedRaidJson[raidIdx]}]";
+
+                await Task.Run(() => SendMessage(new
+                {
+                    message = "parse-lines",
+                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    lines = lineList,
+                    scanning = false,
+                    selectedRegion = regionStr,
+                    raidsToUpload = JsonDocument.Parse(raidsToUploadJson).RootElement.Clone(),
+                    logFilePosition = 0L
+                }));
+
+                var fightsResponses = SendMessageAndCollect(new
+                {
+                    message = "collect-fights",
+                    id = 200 + raidIdx,
+                    pushFightIfNeeded = false,
+                    scanningOnly = false
+                });
+
+                var fightsResult = FindResponseWithKey(fightsResponses, "fights");
+                if (!fightsResult.HasValue ||
+                    !fightsResult.Value.TryGetProperty("fights", out var fightsArray) ||
+                    fightsArray.GetArrayLength() == 0)
+                {
+                    Plugin.Log.Warning($"[Parser] Raid {raidIdx + 1}: no fights produced after replay");
+                    continue;
+                }
+
+                var masterResponses = SendMessageAndCollect(new
+                {
+                    message = "collect-master-info",
+                    id = 300 + raidIdx,
+                    reportCode
+                });
+
+                var masterResult = FindResponseWithKey(masterResponses, "actorsString");
+                if (!masterResult.HasValue)
+                {
+                    Plugin.Log.Warning($"[Parser] Raid {raidIdx + 1}: no master info");
+                    continue;
+                }
+
                 var fr = fightsResult.Value;
+                long globalStartTime = fr.TryGetProperty("startTime", out var st) ? st.GetInt64() : 0;
+                long globalEndTime = fr.TryGetProperty("endTime", out var et) ? et.GetInt64() : globalStartTime;
                 var logVer = fr.TryGetProperty("logVersion", out var lvProp) ? lvProp.GetInt32() : 72;
                 var gameVer = fr.TryGetProperty("gameVersion", out var gvProp) ? gvProp.GetInt32() : 1;
 
-                int bulkIdx = 0;
+                var perFightMaster = BuildMasterTableString(fightsResult, masterResult.Value);
+
+                // A scanned raid may produce multiple committed fights (e.g. multiple
+                // wipes in a pull). Emit each as its own segment so the upload mirrors
+                // what the official client sends.
+                int fightIdxInRaid = 0;
                 foreach (var fight in fightsArray.EnumerateArray())
                 {
+                    var eventsStr = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "";
+                    if (!TryGetLastEventRelativeTime(eventsStr, out long lastRel))
+                    {
+                        fightIdxInRaid++;
+                        continue;
+                    }
+                    long fightEndTime = globalStartTime + lastRel;
                     var fd = new FightData
                     {
                         Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
                         StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
                         EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
-                        EventsString = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "",
+                        EventsString = eventsStr,
                         LogVersion = logVer,
                         GameVersion = gameVer
                     };
-                    fights.Add(fd);
-                    LogFightDiagnostic("BULK", bulkIdx + 1, fd, fight);
-                    bulkIdx++;
+                    LogFightDiagnostic("BULK", uploads.Count + 1, fd, fight);
+                    uploads.Add(new FightUpload(perFightMaster, fd, globalStartTime, fightEndTime));
+                    fightIdxInRaid++;
                 }
-
-                startTime = fr.TryGetProperty("startTime", out var st) ? st.GetInt64() : 0;
-                endTime = fr.TryGetProperty("endTime", out var et) ? et.GetInt64() : 0;
             }
 
-            Plugin.Log.Information($"[Parser] Extracted {fights.Count} fights");
-            if (masterResult.HasValue)
-            {
-                masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
-            }
+            Plugin.Log.Information($"[Parser] Prepared {uploads.Count} fight upload(s)");
         }
         finally
         {
             StopParser();
         }
 
-        return (masterStr, fights, startTime, endTime);
+        return uploads;
     }
 
     /// <summary>
@@ -626,16 +708,39 @@ public class ParserService : IDisposable
     /// </summary>
     private void SendParseLines(List<string> lines, string regionStr, long position)
     {
+        SendParseLines(lines, regionStr, position, scanning: false, raidsToUpload: Array.Empty<object>());
+    }
+
+    private void SendParseLines(List<string> lines, string regionStr, long position, bool scanning, object raidsToUpload)
+    {
         SendMessage(new
         {
             message = "parse-lines",
             id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             lines,
-            scanning = false,
+            scanning,
             selectedRegion = regionStr,
-            raidsToUpload = Array.Empty<object>(),
+            raidsToUpload,
             logFilePosition = position
         });
+    }
+
+    /// <summary>
+    /// Find the first IPC response with the given channel name (e.g. "collect-scanned-raids-completed").
+    /// Use this when the response payload is an array or has no distinguishing key
+    /// — <see cref="FindResponseWithKey"/> only matches object responses by property name.
+    /// </summary>
+    private static JsonElement? FindResponseByChannel(List<JsonElement> responses, string channel)
+    {
+        foreach (var msg in responses)
+        {
+            if (msg.TryGetProperty("channel", out var c) && c.ValueKind == JsonValueKind.String &&
+                c.GetString() == channel)
+            {
+                return msg.TryGetProperty("data", out var d) ? d : msg;
+            }
+        }
+        return null;
     }
 
     private void SendCallWipe()
@@ -646,6 +751,11 @@ public class ParserService : IDisposable
     private void SendSetLiveLoggingStartTime(long startTimeMs)
     {
         SendMessage(new { message = "set-live-logging-start-time", id = 0, startTime = startTimeMs });
+    }
+
+    private void SendSetStartDate(long startDateMs)
+    {
+        SendMessage(new { message = "set-start-date", id = 0, startDate = startDateMs });
     }
 
     /// <summary>
@@ -716,53 +826,45 @@ public class ParserService : IDisposable
             bool fightEndDetected = false;
             DateTime fightEndDetectedTime = DateTime.MinValue;
 
-            // Parse existing file content so the parser has context.
-            var (existingLines, endPos) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, 0);
-            lastPosition = endPos;
-
-            if (existingLines.Count > 0)
+            if (uploadPreviousFights)
             {
-                // set-live-logging-start-time must use the log's own first
-                // timestamp, not Date.now(). Using "now" makes the parser treat
-                // all historical events as outside the live window → 0 fights.
-                foreach (var line in existingLines)
+                // Bulk-upload-via-live-mode: feed the entire existing log so the parser
+                // can detect and upload every fight in the file.
+                var (existingLines, endPos) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, 0);
+                lastPosition = endPos;
+
+                if (existingLines.Count > 0)
                 {
-                    var ts = TryParseLineTime(line);
-                    if (ts.HasValue)
+                    foreach (var line in existingLines)
                     {
-                        var liveStartMs = ts.Value.ToUnixTimeMilliseconds();
-                        SendSetLiveLoggingStartTime(liveStartMs);
-                        Plugin.Log.Debug($"[LiveLog] set-live-logging-start-time: {liveStartMs} (from first log line)");
-                        break;
+                        var ts = TryParseLineTime(line);
+                        if (ts.HasValue)
+                        {
+                            var liveStartMs = ts.Value.ToUnixTimeMilliseconds();
+                            SendSetStartDate(liveStartMs);
+                            SendSetLiveLoggingStartTime(liveStartMs);
+                            Plugin.Log.Debug($"[LiveLog] set-start-date + set-live-logging-start-time: {liveStartMs} (from first log line)");
+                            break;
+                        }
                     }
-                }
 
-                Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
-                await Task.Run(() => SendParseLines(existingLines, regionStr, 0), cancellationToken);
+                    Plugin.Log.Information($"[LiveLog] Sending {existingLines.Count} existing lines for parser context");
+                    await Task.Run(() => SendParseLines(existingLines, regionStr, 0), cancellationToken);
+                }
             }
-
-            if (!uploadPreviousFights)
+            else
             {
-                // pushFightIfNeeded MUST be false here: forcing a push during the
-                // initial catch-up commits whatever partial buffer the parser holds
-                // (e.g. post-phase debuff ticks in an ultimate), creating a phantom
-                // "Unknown" fight that inflates lastFightCount and causes subsequent
-                // real pulls to appear as non-new.
-                var responses = SendMessageAndCollect(new
-                {
-                    message = "collect-fights",
-                    id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    pushFightIfNeeded = false,
-                    scanningOnly = false
-                });
-
-                var existingFights = FindResponseWithKey(responses, "fights");
-                if (existingFights.HasValue && existingFights.Value.TryGetProperty("fights", out var fa))
-                {
-                    lastFightCount = fa.GetArrayLength();
-                    Plugin.Log.Information($"[LiveLog] Skipping {lastFightCount} existing fight(s)");
-                }
-
+                // Match the official client: tail from the current end-of-file. Feeding
+                // historical content into the parser causes its master table to
+                // accumulate actors/abilities from prior fights in the same log
+                // (e.g. earlier raids today), so any upload includes unrelated state
+                // that FFLogs flags as "outdated logger" because it differs from
+                // the official client's per-fight master table.
+                lastPosition = new FileInfo(logPath).Length;
+                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                SendSetStartDate(nowMs);
+                SendSetLiveLoggingStartTime(nowMs);
+                Plugin.Log.Information($"[LiveLog] Tailing from end-of-file (pos={lastPosition}); set-start-date + set-live-logging-start-time: {nowMs}");
                 firstPass = false;
             }
 

@@ -226,18 +226,17 @@ public class FFLogsService
         // 1. Create report
         var reportCode = await CreateReportAsync(logPath, description, visibility, region, guildId);
 
-        // 2. Process log with parser
-        var (masterData, fights, startTime, endTime) = await plugin.ParserService.ProcessLogAsync(logPath, reportCode, region);
+        // 2. Process log with parser — returns one FightUpload per fight, each with a
+        // slim master table scoped to that fight only (matches official client output).
+        var uploads = await plugin.ParserService.ProcessLogAsync(logPath, reportCode, region);
 
-        // 3. Upload each fight segment (with master table before each).
-        // endTime is per-fight (global start + last event relative time) so each
-        // segment has distinct boundaries on the server — matches official client.
-        for (int i = 0; i < fights.Count; i++)
+        // 3. Upload each fight segment with its own master table.
+        for (int i = 0; i < uploads.Count; i++)
         {
             int segmentId = i + 1;
-            long fightEndTime = ComputeFightEndTime(startTime, fights[i].EventsString, endTime);
-            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData, segmentId));
-            await WithRetryAsync(() => UploadSegmentAsync(reportCode, fights[i], segmentId, startTime, fightEndTime));
+            var u = uploads[i];
+            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, u.MasterTable, segmentId));
+            await WithRetryAsync(() => UploadSegmentAsync(reportCode, u.Fight, segmentId, u.FightStartTime, u.FightEndTime));
         }
 
         // 4. Terminate the report
