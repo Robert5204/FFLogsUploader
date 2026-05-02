@@ -31,8 +31,7 @@ public class ParserService : IDisposable
 
     // Wipe director code — distinct from phase-transition codes; triggers call-wipe
     private const string WipeDirectorCode = "40000011";
-
-    // Parser page query parameters
+    private const string ParserGameContentDetectionEnabled = "true";
     private const string ParserMetersEnabled = "false";
     private const string ParserLiveFightDataEnabled = "false";
 
@@ -114,7 +113,18 @@ public class ParserService : IDisposable
             "XIVLauncher", "pluginConfigs", "FFLogsPlugin"
         );
         Directory.CreateDirectory(cacheDir);
-        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_v8.js");
+        // Cache key bumped when settings affect bundle content (e.g., enabling
+        // gameContentDetection makes the server include gameContentTypes data).
+        // Older cached bundles fetched with detection disabled lack that payload.
+        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_v8_v2.js");
+
+        // Best-effort cleanup of older cache files so they don't accumulate.
+        try
+        {
+            var stale = Path.Combine(cacheDir, "fflogs_parser_v8.js");
+            if (File.Exists(stale)) File.Delete(stale);
+        }
+        catch { }
 
         // If cached and fresh (< 24 hours), validate and use it
         if (File.Exists(parserBundlePath) && File.GetLastWriteTimeUtc(parserBundlePath) > DateTime.UtcNow.AddHours(-24))
@@ -137,7 +147,7 @@ public class ParserService : IDisposable
         {
             // Fetch the parser page
             var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&gameContentDetectionEnabled=false&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
+            var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&gameContentDetectionEnabled={ParserGameContentDetectionEnabled}&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
 
             var html = await HttpClient.GetStringAsync(parserPageUrl);
 
@@ -205,7 +215,7 @@ public class ParserService : IDisposable
     /// </summary>
     private const string BrowserShimsJs = @"
         var window = {
-            location: { search: '?id=1&metersEnabled=false&liveFightDataEnabled=false' },
+            location: { search: '?id=1&gameContentDetectionEnabled=true&metersEnabled=false&liveFightDataEnabled=false' },
             addEventListener: function(type, listener) { if (type === 'message') { this._messageListener = listener; } },
             removeEventListener: function() {},
             dispatchEvent: function() { return true; },
@@ -776,6 +786,41 @@ public class ParserService : IDisposable
     }
 
     /// <summary>
+    /// Peek at the tail of the log file to find the most recent parseable timestamp,
+    /// without feeding the file content to the parser. Used to anchor the parser's
+    /// live window to the log's own clock — events that arrive after this point are
+    /// considered live. For real-time ACT logs the tail timestamp ≈ now; for replays
+    /// it's the original recording time, which keeps the live-window filter consistent
+    /// with the timestamps that will actually arrive.
+    /// </summary>
+    private static long? TryReadLatestTimestampFromFile(string logPath)
+    {
+        try
+        {
+            using var fs = File.Open(logPath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            long len = fs.Length;
+            if (len == 0) return null;
+
+            int peekSize = (int)Math.Min(8192, len);
+            fs.Seek(-peekSize, SeekOrigin.End);
+            var buf = new byte[peekSize];
+            int read = fs.Read(buf, 0, peekSize);
+            var tail = System.Text.Encoding.UTF8.GetString(buf, 0, read);
+
+            // Walk lines from the back; first parseable timestamp is the most recent.
+            var lines = tail.Split('\n');
+            for (int i = lines.Length - 1; i >= 0; i--)
+            {
+                var ts = TryParseLineTime(lines[i]);
+                if (ts.HasValue) return ts.Value.ToUnixTimeMilliseconds();
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    /// <summary>
     /// Start live logging — monitors the latest log file and uploads fights as they complete.
     /// </summary>
     public async Task StartLiveLogAsync(
@@ -854,17 +899,46 @@ public class ParserService : IDisposable
             }
             else
             {
-                // Match the official client: tail from the current end-of-file. Feeding
-                // historical content into the parser causes its master table to
-                // accumulate actors/abilities from prior fights in the same log
-                // (e.g. earlier raids today), so any upload includes unrelated state
-                // that FFLogs flags as "outdated logger" because it differs from
-                // the official client's per-fight master table.
-                lastPosition = new FileInfo(logPath).Length;
-                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                SendSetStartDate(nowMs);
-                SendSetLiveLoggingStartTime(nowMs);
-                Plugin.Log.Information($"[LiveLog] Tailing from end-of-file (pos={lastPosition}); set-start-date + set-live-logging-start-time: {nowMs}");
+                // Feed historical content with scanning=true so the parser learns
+                // zone/encounter context (e.g. that the player is currently inside
+                // Dragonsong's Reprise) without committing fights or adding actors
+                // to the master table. Without this context, ultimates fragment into
+                // one trash-fight commit per phase boundary because the parser doesn't
+                // know the surrounding events are part of a recognized encounter.
+                //
+                // A previous attempt tailed straight from EOF to keep the master table
+                // clean, but that path also discarded the zone-in event the parser
+                // needs to identify the encounter — so DSR/UWU/UCOB pulls uploaded
+                // as separate trash kills per phase. Scanning mode gives us the best
+                // of both: zone/raid metadata accumulates, per-actor master state
+                // does not.
+                var (existingLines, endPos) = await LogFileHelper.ReadNewLinesSharedAsync(logPath, 0);
+                lastPosition = endPos;
+
+                long? firstLineMs = null;
+                foreach (var line in existingLines)
+                {
+                    var ts = TryParseLineTime(line);
+                    if (ts.HasValue) { firstLineMs = ts.Value.ToUnixTimeMilliseconds(); break; }
+                }
+                if (firstLineMs.HasValue) SendSetStartDate(firstLineMs.Value);
+
+                // Anchor the live window to the log's own clock so events that arrive
+                // after this point qualify as live. For a real-time ACT log the tail
+                // timestamp ≈ now; for a replayed log it's the original recording time,
+                // which keeps the live filter aligned with the timestamps that will
+                // actually arrive.
+                var anchorMs = TryReadLatestTimestampFromFile(logPath)
+                              ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                SendSetLiveLoggingStartTime(anchorMs);
+
+                if (existingLines.Count > 0)
+                {
+                    Plugin.Log.Information($"[LiveLog] Scanning {existingLines.Count} historical line(s) for context (no commits)");
+                    await Task.Run(() => SendParseLines(existingLines, regionStr, 0,
+                        scanning: true, raidsToUpload: Array.Empty<object>()), cancellationToken);
+                }
+                Plugin.Log.Information($"[LiveLog] Live tail starts at pos={lastPosition}; live-window anchor={anchorMs}");
                 firstPass = false;
             }
 
