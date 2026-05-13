@@ -278,9 +278,28 @@ public class ParserService : IDisposable
         URLSearchParams.prototype.set = function(k, v) { this._params[k] = v; };
         URLSearchParams.prototype.has = function(k) { return this._params.hasOwnProperty(k); };
 
-        // IPC output — calls back into C# via host object
+        // IPC capture helper — used by both our sendToHost shim and the source.postMessage
+        // mock. The parser bundle later defines its own sendToHost that mutates the data
+        // object with .message/.id properties and calls event.source.postMessage(obj).
+        // For Array payloads, JSON.stringify drops named properties, so we wrap them
+        // explicitly into a {message, id, data} envelope before capture.
+        function __captureMessage(r) {
+            if (r && typeof r === 'object') {
+                if (Array.isArray(r)) {
+                    __ipc.capture(JSON.stringify({
+                        message: r.message,
+                        id: r.id,
+                        data: Array.from(r)
+                    }));
+                    return;
+                }
+            }
+            __ipc.capture(JSON.stringify(r));
+        }
+
+        // Our initial sendToHost (parser bundle overrides this with its own version)
         window.sendToHost = function(channel, id, event, data) {
-            __ipc.capture(JSON.stringify({ channel: channel, id: id, data: data }));
+            __captureMessage({ message: channel, id: id, data: data });
         };
 
         // Helper to dispatch a message to the parser (replaces stdin JSON protocol)
@@ -289,7 +308,7 @@ public class ParserService : IDisposable
             var msg = JSON.parse(msgJson);
             window._messageListener({
                 data: msg,
-                source: { postMessage: function(r) { __ipc.capture(JSON.stringify(r)); } },
+                source: { postMessage: function(r) { __captureMessage(r); } },
                 origin: 'emulator'
             });
             __drainTimeouts();
@@ -396,7 +415,8 @@ public class ParserService : IDisposable
     {
         foreach (var msg in responses)
         {
-            if (msg.TryGetProperty("data", out var d) && d.TryGetProperty(key, out _))
+            if (msg.ValueKind != JsonValueKind.Object) continue;
+            if (msg.TryGetProperty("data", out var d) && d.ValueKind == JsonValueKind.Object && d.TryGetProperty(key, out _))
                 return d;
             if (msg.TryGetProperty(key, out _))
                 return msg;
@@ -736,15 +756,18 @@ public class ParserService : IDisposable
     }
 
     /// <summary>
-    /// Find the first IPC response with the given channel name (e.g. "collect-scanned-raids-completed").
+    /// Find the first IPC response with the given message name (e.g. "collect-scanned-raids-completed").
     /// Use this when the response payload is an array or has no distinguishing key
     /// — <see cref="FindResponseWithKey"/> only matches object responses by property name.
+    /// All parser responses use the `message` field for the channel name; array payloads
+    /// are wrapped by __captureMessage so they expose `message`/`id`/`data` consistently.
     /// </summary>
     private static JsonElement? FindResponseByChannel(List<JsonElement> responses, string channel)
     {
         foreach (var msg in responses)
         {
-            if (msg.TryGetProperty("channel", out var c) && c.ValueKind == JsonValueKind.String &&
+            if (msg.ValueKind != JsonValueKind.Object) continue;
+            if (msg.TryGetProperty("message", out var c) && c.ValueKind == JsonValueKind.String &&
                 c.GetString() == channel)
             {
                 return msg.TryGetProperty("data", out var d) ? d : msg;

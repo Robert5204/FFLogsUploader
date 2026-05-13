@@ -149,6 +149,9 @@ public class FFLogsApiService
                 .GetProperty("reportData")
                 .GetProperty("report");
 
+            if (report.ValueKind != JsonValueKind.Object)
+                return (fights, 0);
+
             if (report.TryGetProperty("exportedSegments", out var es))
                 exportedSegments = es.GetInt32();
 
