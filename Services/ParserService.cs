@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -113,16 +114,17 @@ public class ParserService : IDisposable
             "XIVLauncher", "pluginConfigs", "FFLogsPlugin"
         );
         Directory.CreateDirectory(cacheDir);
-        // Cache key bumped when settings affect bundle content (e.g., enabling
-        // gameContentDetection makes the server include gameContentTypes data).
-        // Older cached bundles fetched with detection disabled lack that payload.
-        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_v8_v2.js");
+        // Cache key bumped when the upstream parser changes (parserVersion 2075).
+        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_v8_v3.js");
 
         // Best-effort cleanup of older cache files so they don't accumulate.
         try
         {
-            var stale = Path.Combine(cacheDir, "fflogs_parser_v8.js");
-            if (File.Exists(stale)) File.Delete(stale);
+            foreach (var stale in new[] { "fflogs_parser_v8.js", "fflogs_parser_v8_v2.js" })
+            {
+                var p = Path.Combine(cacheDir, stale);
+                if (File.Exists(p)) File.Delete(p);
+            }
         }
         catch { }
 
@@ -587,6 +589,8 @@ public class ParserService : IDisposable
                         StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
                         EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
                         EventsString = eventsStr,
+                        EventCount = fight.TryGetProperty("eventCount", out var ec) && ec.ValueKind == JsonValueKind.Number
+                            ? ec.GetInt32() : 0,
                         LogVersion = logVer,
                         GameVersion = gameVer
                     };
@@ -609,17 +613,16 @@ public class ParserService : IDisposable
     /// <summary>
     /// Builds the master table string that FFLogs expects for report uploads.
     ///
-    /// Format (proprietary FFLogs format):
+    /// Matches the official client's compressMasterInfo format:
     ///   Line 1: "{logVersion}|{gameVersion}|{logFileDetails}"
-    ///   Then for each section (in strict order):
-    ///     - Line: count of entries
-    ///     - Lines: the entries themselves
-    ///
-    /// Section order: actorsString, abilitiesString, tuplesString, petsString
+    ///   Then in strict order, each section emitted as:
+    ///     - Line: {lastAssigned*ID} (from master data)
+    ///     - Raw: {sectionString} (already newline-delimited)
+    ///   Sections: actors, abilities, tuples, pets.
     /// </summary>
     private string BuildMasterTableString(JsonElement? fightsData, JsonElement masterData)
     {
-        var parts = new List<string>();
+        var sb = new StringBuilder();
 
         var logVersion = 72;
         var gameVersion = 1;
@@ -633,28 +636,33 @@ public class ParserService : IDisposable
             logFileDetails = fd.TryGetProperty("logFileDetails", out var lfd) ? lfd.GetString() ?? "" : "";
         }
 
-        parts.Add($"{logVersion}|{gameVersion}|{logFileDetails}");
+        sb.Append(logVersion).Append('|').Append(gameVersion).Append('|').Append(logFileDetails).Append('\n');
 
-        string[] sectionKeys = { "actorsString", "abilitiesString", "tuplesString", "petsString" };
-
-        foreach (var key in sectionKeys)
+        // Section order and the lastAssigned*ID key paired with each string field.
+        var sections = new (string IdKey, string StringKey)[]
         {
-            var value = "";
-            if (masterData.TryGetProperty(key, out var prop))
-            {
-                value = prop.GetString() ?? "";
-            }
+            ("lastAssignedActorID", "actorsString"),
+            ("lastAssignedAbilityID", "abilitiesString"),
+            ("lastAssignedTupleID", "tuplesString"),
+            ("lastAssignedPetID", "petsString"),
+        };
 
-            var lines = value.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                             .Where(l => !string.IsNullOrWhiteSpace(l))
-                             .ToList();
+        foreach (var (idKey, stringKey) in sections)
+        {
+            int lastId = masterData.TryGetProperty(idKey, out var idProp) && idProp.ValueKind == JsonValueKind.Number
+                ? idProp.GetInt32()
+                : 0;
+            var value = masterData.TryGetProperty(stringKey, out var prop) ? prop.GetString() ?? "" : "";
 
-            parts.Add(lines.Count.ToString());
-            parts.AddRange(lines);
+            sb.Append(lastId).Append('\n').Append(value);
+            // Official sectionString already ends with \n per entry; only add one if missing
+            // so the next lastAssigned line starts on its own row.
+            if (value.Length > 0 && value[^1] != '\n')
+                sb.Append('\n');
         }
 
-        var result = string.Join("\n", parts);
-        Plugin.Log.Debug($"[Parser] Master table: {result.Length} chars, header: {parts[0]}");
+        var result = sb.ToString();
+        Plugin.Log.Debug($"[Parser] Master table: {result.Length} chars");
         return result;
     }
 
@@ -1171,6 +1179,8 @@ public class ParserService : IDisposable
                                 StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
                                 EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
                                 EventsString = eventsStr,
+                                EventCount = fight.TryGetProperty("eventCount", out var ec) && ec.ValueKind == JsonValueKind.Number
+                                    ? ec.GetInt32() : 0,
                                 LogVersion = logVer,
                                 GameVersion = gameVer
                             };

@@ -20,8 +20,8 @@ namespace FFLogsPlugin.Services;
 public class FFLogsService
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
-    private const string CLIENT_VERSION = "9.0.33";
-    private const int PARSER_VERSION = 1074;
+    private const string CLIENT_VERSION = "9.3.65";
+    private const int PARSER_VERSION = 2075;
     private const int MaxRetries = 3;
     
     private readonly Plugin plugin;
@@ -88,7 +88,8 @@ public class FFLogsService
             {
                 ["email"] = email,
                 ["password"] = password,
-                ["version"] = CLIENT_VERSION
+                ["version"] = CLIENT_VERSION,
+                ["clientTime"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
             };
 
             var json = JsonSerializer.Serialize(payload);
@@ -272,7 +273,7 @@ public class FFLogsService
                     if (reportCode == null)
                     {
                         Plugin.Log.Information("[LiveLog] First fight detected - creating report...");
-                        reportCode = await CreateReportAsync("live_log", description, visibility, region, guildId);
+                        reportCode = await CreateReportAsync("live.log", description, visibility, region, guildId);
                         CurrentReportCode = reportCode;
 
                         // Inform the parser so subsequent collect-master-info calls
@@ -473,9 +474,9 @@ public class FFLogsService
 
     private async Task UploadSegmentAsync(string reportCode, FightData fight, int segmentId, long startTime, long endTime, bool isLive = false)
     {
-        // Format events: header + count + events
-        var lines = fight.EventsString.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        var eventsContent = $"{fight.LogVersion}|{fight.GameVersion}\n{lines.Length}\n{fight.EventsString}";
+        // Format events: header + count + events. Use the parser-provided eventCount
+        // (numeric eventId delta, not line count) to match the official client exactly.
+        var eventsContent = $"{fight.LogVersion}|{fight.GameVersion}\n{fight.EventCount}\n{fight.EventsString}";
         
         using var memoryStream = new MemoryStream();
         using (var zipArchive = new System.IO.Compression.ZipArchive(memoryStream, System.IO.Compression.ZipArchiveMode.Create, true))
@@ -551,6 +552,7 @@ public class FightData
     public long StartTime { get; set; }
     public long EndTime { get; set; }
     public string EventsString { get; set; } = string.Empty;
+    public int EventCount { get; set; }
     public int LogVersion { get; set; } = 72;
     public int GameVersion { get; set; } = 1;
 }
