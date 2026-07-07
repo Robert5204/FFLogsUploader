@@ -48,12 +48,26 @@ public class ParserService : IDisposable
         "40000005", // Duty complete (alternative)
     };
 
+    // Fallback parser version, used only if we can't read it out of the downloaded
+    // parser bundle. The real value is detected in EnsureParserAsync so create-report
+    // always advertises the same parserVersion the current parser bundle reports —
+    // matching how the Archon app queries the parser via `get-parser-version` rather
+    // than hardcoding it.
+    private const int FallbackParserVersion = 2075;
+
     private readonly Plugin plugin;
     private string? parserBundlePath;
     private V8ScriptEngine? engine;
     private readonly List<JsonElement> ipcMessages = new();
     private readonly object ipcLock = new();
     private string? currentReportCode;
+
+    /// <summary>
+    /// The parser version reported by the current parser bundle (the glue's
+    /// <c>const parserVersion = N</c>). Detected during <see cref="EnsureParserAsync"/>;
+    /// defaults to <see cref="FallbackParserVersion"/> until then.
+    /// </summary>
+    public int ParserVersion { get; private set; } = FallbackParserVersion;
 
     // Serializes all V8 engine access — V8ScriptEngine is not thread-safe
     private readonly SemaphoreSlim engineLock = new(1, 1);
@@ -135,6 +149,7 @@ public class ParserService : IDisposable
             if (cachedSize > 10000)
             {
                 Plugin.Log.Information($"Using cached parser: {parserBundlePath}");
+                DetectParserVersion(await File.ReadAllTextAsync(parserBundlePath));
                 return;
             }
 
@@ -151,7 +166,16 @@ public class ParserService : IDisposable
             var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&gameContentDetectionEnabled={ParserGameContentDetectionEnabled}&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
 
-            var html = await HttpClient.GetStringAsync(parserPageUrl);
+            // Archon loads this page as an iframe navigation, not a fetch — match that
+            // request fingerprint (navigate/iframe, no sec-ch-ua* client hints).
+            string html;
+            using (var pageRequest = new HttpRequestMessage(HttpMethod.Get, parserPageUrl))
+            {
+                FFLogsService.ApplyArchonHeaders(pageRequest, FFLogsService.RequestKind.ParserPage);
+                using var pageResponse = await HttpClient.SendAsync(pageRequest);
+                pageResponse.EnsureSuccessStatusCode();
+                html = await pageResponse.Content.ReadAsStringAsync();
+            }
 
             // Extract parser URL from HTML
             var match = Regex.Match(html, @"src=""([^""]+parser-ff[^""]+)""");
@@ -163,8 +187,16 @@ public class ParserService : IDisposable
             var parserUrl = match.Groups[1].Value;
             Plugin.Log.Debug($"Found parser URL: {parserUrl}");
 
-            // Download the parser
-            var parserCode = await HttpClient.GetStringAsync(parserUrl);
+            // Download the parser JS — Archon fetches this from assets.rpglogs.com as a
+            // no-cors <script> load. Match that fingerprint (no-cors/script).
+            string parserCode;
+            using (var scriptRequest = new HttpRequestMessage(HttpMethod.Get, parserUrl))
+            {
+                FFLogsService.ApplyArchonHeaders(scriptRequest, FFLogsService.RequestKind.Script);
+                using var scriptResponse = await HttpClient.SendAsync(scriptRequest);
+                scriptResponse.EnsureSuccessStatusCode();
+                parserCode = await scriptResponse.Content.ReadAsStringAsync();
+            }
 
             // Extract inline glue code
             var scriptBlocks = Regex.Matches(html, @"<script type=""text/javascript"">([\s\S]*?)</script>");
@@ -177,6 +209,9 @@ public class ParserService : IDisposable
                     break;
                 }
             }
+
+            // Read the parser version out of the (non-minified) glue while we have it.
+            DetectParserVersion(glueCode);
 
             // Bundle parser + glue only (no Node.js wrapper needed)
             var fullBundle = parserCode + "\n\n" + glueCode;
@@ -208,6 +243,42 @@ public class ParserService : IDisposable
             try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
             Plugin.Log.Error(ex, "Failed to download parser");
             throw new Exception($"Failed to download parser: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Ensures the parser bundle is downloaded/cached and returns its parser version.
+    /// Cheap after the first call (the bundle is cached for 24h). Call this before
+    /// creating a report so create-report advertises the exact parserVersion the
+    /// current parser reports, instead of a hardcoded constant.
+    /// </summary>
+    public async Task<int> EnsureParserVersionAsync()
+    {
+        await EnsureParserAsync();
+        return ParserVersion;
+    }
+
+    /// <summary>
+    /// Reads the parser version out of a bundle/glue string — the glue defines it as a
+    /// non-minified <c>const parserVersion = N;</c>. Updates <see cref="ParserVersion"/>
+    /// on success; leaves the previous (fallback) value if the marker isn't found.
+    /// </summary>
+    private void DetectParserVersion(string bundleOrGlue)
+    {
+        // The parser JS core and the glue each declare `const parserVersion = N`. When
+        // passed the full bundle (parserCode + glue), the glue's value is the last match
+        // because the glue is always concatenated last — take that one.
+        var matches = Regex.Matches(bundleOrGlue, @"const\s+parserVersion\s*=\s*(\d{3,6})");
+        if (matches.Count > 0 &&
+            int.TryParse(matches[^1].Groups[1].Value, out var v) && v > 0)
+        {
+            if (v != ParserVersion)
+                Plugin.Log.Information($"[Parser] Detected parserVersion={v} (was {ParserVersion})");
+            ParserVersion = v;
+        }
+        else
+        {
+            Plugin.Log.Warning($"[Parser] Could not detect parserVersion in bundle; using {ParserVersion}");
         }
     }
 
@@ -789,6 +860,28 @@ public class ParserService : IDisposable
         SendMessage(new { message = "call-wipe", id = 0 });
     }
 
+    /// <summary>
+    /// Sends check-dungeon-inactivity and returns the parser's <c>justFired</c> flag —
+    /// true when the parser has just decided the current dungeon/game content went
+    /// inactive and ended it (so its fight is now committable). <paramref name="clientSideTimeMs"/>
+    /// is wall-clock time in ms (what the Archon app passes as <c>Date.now()</c>).
+    /// </summary>
+    private bool SendCheckDungeonInactivity(long clientSideTimeMs)
+    {
+        var responses = SendMessageAndCollect(new
+        {
+            message = "check-dungeon-inactivity",
+            id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            clientSideTime = clientSideTimeMs
+        });
+
+        var result = FindResponseByChannel(responses, "check-dungeon-inactivity-completed");
+        return result.HasValue
+            && result.Value.ValueKind == JsonValueKind.Object
+            && result.Value.TryGetProperty("justFired", out var jf)
+            && jf.ValueKind == JsonValueKind.True;
+    }
+
     private void SendSetLiveLoggingStartTime(long startTimeMs)
     {
         SendMessage(new { message = "set-live-logging-start-time", id = 0, startTime = startTimeMs });
@@ -853,12 +946,15 @@ public class ParserService : IDisposable
 
     /// <summary>
     /// Start live logging — monitors the latest log file and uploads fights as they complete.
+    /// The <paramref name="onFightComplete"/> callback receives
+    /// (masterTable, fight, segmentId, startTime, endTime, inProgressEventCount); a non-zero
+    /// inProgressEventCount marks a still-in-progress fight (real-time live logging).
     /// </summary>
     public async Task StartLiveLogAsync(
         string logDirectory,
         int region,
         bool uploadPreviousFights,
-        Func<string, FightData, int, long, long, Task> onFightComplete,
+        Func<string, FightData, int, long, long, int, Task> onFightComplete,
         CancellationToken cancellationToken = default)
     {
         await StartParserAsync();
@@ -901,6 +997,10 @@ public class ParserService : IDisposable
             bool firstPass = true;
             bool fightEndDetected = false;
             DateTime fightEndDetectedTime = DateTime.MinValue;
+            // Real-time live logging: eventCount of the in-progress fight last uploaded as a
+            // provisional segment. Reset to -1 whenever a fight commits so the next fight
+            // starts fresh. Stays -1 (unused) unless the account has realTimeLiveLogging.
+            int lastInProgressEventCount = -1;
 
             if (uploadPreviousFights)
             {
@@ -1006,6 +1106,32 @@ public class ParserService : IDisposable
                         Plugin.Log.Information("[LiveLog] Caught up with file — live phase started, call-wipe now active");
                     }
 
+                    // Ask the parser whether dungeon/game content has gone inactive
+                    // ("slow growth"). Archon calls this every live poll with wall-clock
+                    // time; on justFired the parser has ended the dungeon, so its fight
+                    // commits and we poll for it. This replaces guessing dungeon ends from
+                    // a hardcoded director-code list. Only meaningful once we're tailing
+                    // live — during historical catch-up the wall-clock window doesn't line
+                    // up with the log's own timestamps, so we skip it until livePhaseReady.
+                    if (livePhaseReady && !fightEndDetected)
+                    {
+                        bool justFired = false;
+                        try
+                        {
+                            justFired = SendCheckDungeonInactivity(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.Log.Debug($"[LiveLog] check-dungeon-inactivity failed: {ex.Message}");
+                        }
+                        if (justFired)
+                        {
+                            Plugin.Log.Information("[LiveLog] Parser reported dungeon inactivity — treating as fight end");
+                            fightEndDetected = true;
+                            fightEndDetectedTime = DateTime.UtcNow;
+                        }
+                    }
+
                     // Check for a newer log file periodically
                     if ((DateTime.UtcNow - lastFileCheckTime).TotalSeconds > FileCheckIntervalSeconds)
                     {
@@ -1051,7 +1177,26 @@ public class ParserService : IDisposable
                         // our fight-end detector repeatedly. Forcing a push at those points
                         // commits a tiny garbage buffer as a phantom "Unknown" fight.
                         // The parser commits real fights naturally — we just poll for them.
+                        int prevFightCount = lastFightCount;
                         lastFightCount = await CheckForFightsAsync(lastFightCount, onFightComplete, pushFightIfNeeded: false);
+                        // A fight just committed — the next in-progress fight starts fresh.
+                        if (lastFightCount != prevFightCount) lastInProgressEventCount = -1;
+                    }
+
+                    // Real-time live logging only: push the currently in-progress fight as a
+                    // provisional segment so the report updates mid-fight (Archon's
+                    // collect-in-progress-fight path). Inert for accounts without the feature.
+                    if (plugin.FFLogsService.RealTimeLiveLoggingEnabled && livePhaseReady && !checkPending)
+                    {
+                        try
+                        {
+                            lastInProgressEventCount = await CheckInProgressFightAsync(
+                                lastFightCount, lastInProgressEventCount, onFightComplete);
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.Log.Debug($"[LiveLog] in-progress upload failed: {ex.Message}");
+                        }
                     }
 
                     await Task.Delay(LiveLogPollIntervalMs, cancellationToken);
@@ -1119,7 +1264,7 @@ public class ParserService : IDisposable
         }
     }
 
-    private async Task<int> CheckForFightsAsync(int lastFightCount, Func<string, FightData, int, long, long, Task> onFightComplete, bool pushFightIfNeeded = false)
+    private async Task<int> CheckForFightsAsync(int lastFightCount, Func<string, FightData, int, long, long, int, Task> onFightComplete, bool pushFightIfNeeded = false)
     {
         var fightsResponses = SendMessageAndCollect(new
         {
@@ -1187,7 +1332,8 @@ public class ParserService : IDisposable
 
                             Plugin.Log.Information($"[LiveLog] Uploading: {fightData.Name} (segment {i + 1})");
                             LogFightDiagnostic("LIVE", i + 1, fightData, fight);
-                            await onFightComplete(masterStr, fightData, i + 1, globalStartTime, fightEndTime);
+                            // Committed fight — inProgressEventCount 0 (finalized).
+                            await onFightComplete(masterStr, fightData, i + 1, globalStartTime, fightEndTime, 0);
                         }
                         i++;
                     }
@@ -1198,6 +1344,77 @@ public class ParserService : IDisposable
             return currentCount > lastFightCount ? currentCount : lastFightCount;
         }
         return lastFightCount;
+    }
+
+    /// <summary>
+    /// Real-time live logging only: uploads the currently in-progress fight as a
+    /// provisional segment (segmentId = committedFightCount + 1) with a non-zero
+    /// inProgressEventCount, mirroring the Archon app's <c>collect-in-progress-fight</c>
+    /// usage. Re-uploads only when the fight has grown (eventCount increased). Returns the
+    /// eventCount last uploaded, or <paramref name="lastInProgressEventCount"/> if nothing
+    /// was uploaded. The fight is finalized normally by <see cref="CheckForFightsAsync"/>
+    /// once it commits (same segmentId, inProgressEventCount 0).
+    /// </summary>
+    private async Task<int> CheckInProgressFightAsync(int committedFightCount, int lastInProgressEventCount,
+        Func<string, FightData, int, long, long, int, Task> onFightComplete)
+    {
+        var responses = SendMessageAndCollect(new
+        {
+            message = "collect-in-progress-fight",
+            id = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        });
+
+        var fightsResult = FindResponseWithKey(responses, "fights");
+        if (!fightsResult.HasValue ||
+            !fightsResult.Value.TryGetProperty("fights", out var fightsArray) ||
+            fightsArray.GetArrayLength() == 0)
+            return lastInProgressEventCount; // no fight in progress
+
+        // There is only ever a single in-progress fight.
+        JsonElement fight = default;
+        bool hasFight = false;
+        foreach (var f in fightsArray.EnumerateArray()) { fight = f; hasFight = true; break; }
+        if (!hasFight) return lastInProgressEventCount;
+
+        var eventsStr = fight.TryGetProperty("eventsString", out var ev) ? ev.GetString() ?? "" : "";
+        if (!TryGetLastEventRelativeTime(eventsStr, out long lastRel))
+            return lastInProgressEventCount; // nothing recorded yet
+
+        int eventCount = fight.TryGetProperty("eventCount", out var ecp) && ecp.ValueKind == JsonValueKind.Number
+            ? ecp.GetInt32() : 0;
+        if (eventCount <= lastInProgressEventCount)
+            return lastInProgressEventCount; // no growth since last provisional upload
+
+        object masterMsg = currentReportCode != null
+            ? new { message = "collect-master-info", id = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), reportCode = currentReportCode }
+            : (object)new { message = "collect-master-info", id = DateTimeOffset.UtcNow.ToUnixTimeSeconds() };
+        var masterResponses = SendMessageAndCollect(masterMsg);
+        var masterResult = FindResponseWithKey(masterResponses, "actorsString");
+        if (!masterResult.HasValue)
+            return lastInProgressEventCount;
+
+        var fr = fightsResult.Value;
+        long globalStartTime = fr.TryGetProperty("startTime", out var gst) ? gst.GetInt64() : 0;
+        var logVer = fr.TryGetProperty("logVersion", out var lvProp) ? lvProp.GetInt32() : 72;
+        var gameVer = fr.TryGetProperty("gameVersion", out var gvProp) ? gvProp.GetInt32() : 1;
+        var masterStr = BuildMasterTableString(fightsResult, masterResult.Value);
+
+        var fightData = new FightData
+        {
+            Name = fight.TryGetProperty("name", out var n) ? n.GetString() ?? "Unknown" : "Unknown",
+            StartTime = fight.TryGetProperty("startTime", out var s) ? s.GetInt64() : 0,
+            EndTime = fight.TryGetProperty("endTime", out var e) ? e.GetInt64() : 0,
+            EventsString = eventsStr,
+            EventCount = eventCount,
+            LogVersion = logVer,
+            GameVersion = gameVer
+        };
+        long fightEndTime = globalStartTime + lastRel;
+        int segmentId = committedFightCount + 1;
+
+        Plugin.Log.Information($"[LiveLog] Uploading IN-PROGRESS {fightData.Name} (segment {segmentId}, inProgressEventCount={eventCount})");
+        await onFightComplete(masterStr, fightData, segmentId, globalStartTime, fightEndTime, eventCount);
+        return eventCount;
     }
 
     /// <summary>

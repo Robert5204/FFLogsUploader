@@ -20,8 +20,10 @@ namespace FFLogsPlugin.Services;
 public class FFLogsService
 {
     private const string FFLOGS_URL = "https://www.fflogs.com";
-    private const string CLIENT_VERSION = "9.3.65";
-    private const int PARSER_VERSION = 2075;
+    // Must match a currently-supported Archon App Lite version. FFLogs deprecated the
+    // standalone "FFLogsUploader" client and now gates the desktop-client endpoints on
+    // the Archon app's version/User-Agent — an out-of-date value is rejected server-side.
+    private const string CLIENT_VERSION = "9.3.85";
     private const int MaxRetries = 3;
     
     private readonly Plugin plugin;
@@ -34,6 +36,11 @@ public class FFLogsService
     public string? CurrentReportCode { get; private set; }
     public string? Username { get; private set; }
     public List<GuildInfo> Guilds { get; private set; } = new();
+
+    // From the login response's enabledFeatures. When true the account may upload fights
+    // while they're still in progress (real-time live logging); otherwise in-progress
+    // fights are only tracked for status and uploaded once they commit — matching Archon.
+    public bool RealTimeLiveLoggingEnabled { get; private set; }
 
     // Recently uploaded report codes (for Parse Viewer)
     public List<string> RecentReportCodes { get; } = new();
@@ -54,29 +61,113 @@ public class FFLogsService
         {
             CookieContainer = cookies,
             UseCookies = true,
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+            // Archon advertises "gzip, deflate, br, zstd". We advertise everything the
+            // Electron client does that .NET can also transparently decode — gzip,
+            // deflate, and brotli. zstd is intentionally omitted: HttpClient cannot
+            // decompress it, and advertising it would risk the server returning an
+            // undecodable body. In practice FFLogs negotiates down to brotli anyway.
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
         };
-        
-        // Wrap with XSRF handler so every request automatically gets the token
-        var xsrfHandler = new XsrfDelegatingHandler(cookies, new Uri(FFLOGS_URL), innerHandler);
-        
-        HttpClient = new HttpClient(xsrfHandler)
+
+        // The Archon uploader authenticates these desktop-client routes purely with the
+        // session cookies (XSRF-TOKEN, wcl_session, remember_web) — the CookieContainer
+        // sends those automatically. It never adds an X-XSRF-TOKEN *header*, so we don't
+        // either; the routes are CSRF-exempt server-side. (The former XsrfDelegatingHandler
+        // is left in the project unused in case a future endpoint needs it.)
+        HttpClient = new HttpClient(innerHandler)
         {
             BaseAddress = new Uri(FFLOGS_URL)
         };
-        
-        // Match the official FFLogs client headers exactly
-        HttpClient.DefaultRequestHeaders.Add("User-Agent", $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) FFLogsUploader/{CLIENT_VERSION} Chrome/138.0.7204.251 Electron/37.7.0 Safari/537.36");
-        HttpClient.DefaultRequestHeaders.Add("Accept", "*/*");
+
+        // Only the headers Archon sends on *every* request live here. The Accept,
+        // Sec-Fetch-Mode/Dest, sec-ch-ua*, Content-Type and Upgrade-Insecure-Requests
+        // headers vary by request type (JSON API vs multipart upload vs iframe
+        // navigation vs no-cors script) and are applied per request in
+        // ApplyArchonHeaders so each call matches the real client byte-for-byte.
+        HttpClient.DefaultRequestHeaders.Add("User-Agent", $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ArchonAppLite/{CLIENT_VERSION} Chrome/138.0.7204.251 Electron/37.9.0 Safari/537.36");
         HttpClient.DefaultRequestHeaders.Add("Accept-Language", "en-US");
-        HttpClient.DefaultRequestHeaders.Add("sec-ch-ua", "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\"");
-        HttpClient.DefaultRequestHeaders.Add("sec-ch-ua-mobile", "?0");
-        HttpClient.DefaultRequestHeaders.Add("sec-ch-ua-platform", "\"Windows\"");
         HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Site", "cross-site");
-        HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Mode", "cors");
-        HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Dest", "empty");
         HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Storage-Access", "active");
     }
+
+    /// <summary>
+    /// The kinds of request the Archon uploader makes, each with its own header
+    /// fingerprint (Accept, Sec-Fetch-Mode/Dest, and whether sec-ch-ua* client hints
+    /// are present). Derived from Fiddler captures of Archon App Lite 9.3.85.
+    /// </summary>
+    public enum RequestKind
+    {
+        /// <summary>POST with a JSON body (log-in, create-report).</summary>
+        JsonApi,
+        /// <summary>POST with an empty body (token/v2, terminate-report).</summary>
+        EmptyPost,
+        /// <summary>POST multipart/form-data upload (set-report-master-table, add-report-segment).</summary>
+        Multipart,
+        /// <summary>GET of the parser HTML page — loaded as an iframe navigation.</summary>
+        ParserPage,
+        /// <summary>GET of the parser JS from assets.rpglogs.com — a no-cors script fetch.</summary>
+        Script,
+    }
+
+    /// <summary>
+    /// Applies the per-request headers Archon sends for the given <paramref name="kind"/>,
+    /// so plugin requests match the official uploader's fingerprint. The universal
+    /// headers (User-Agent, Accept-Language, Sec-Fetch-Site, Sec-Fetch-Storage-Access)
+    /// come from DefaultRequestHeaders; Content-Type is set on the request content.
+    /// </summary>
+    public static void ApplyArchonHeaders(HttpRequestMessage request, RequestKind kind)
+    {
+        // Chromium sends sec-ch-ua* client hints on every fetch/XHR/script request,
+        // but omits them on top-level/iframe navigations — which is how Archon loads
+        // the parser page.
+        if (kind != RequestKind.ParserPage)
+        {
+            request.Headers.TryAddWithoutValidation("sec-ch-ua", "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\"");
+            request.Headers.TryAddWithoutValidation("sec-ch-ua-mobile", "?0");
+            request.Headers.TryAddWithoutValidation("sec-ch-ua-platform", "\"Windows\"");
+        }
+
+        switch (kind)
+        {
+            case RequestKind.JsonApi:
+            case RequestKind.EmptyPost:
+                request.Headers.TryAddWithoutValidation("Accept", "*/*");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Mode", "cors");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Dest", "empty");
+                break;
+            case RequestKind.Multipart:
+                request.Headers.TryAddWithoutValidation("Accept", "application/json");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Mode", "cors");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Dest", "empty");
+                break;
+            case RequestKind.ParserPage:
+                request.Headers.TryAddWithoutValidation("Upgrade-Insecure-Requests", "1");
+                request.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Mode", "navigate");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Dest", "iframe");
+                break;
+            case RequestKind.Script:
+                request.Headers.TryAddWithoutValidation("Accept", "*/*");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Mode", "no-cors");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Dest", "script");
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Builds a JSON request body with a bare <c>application/json</c> Content-Type
+    /// (no <c>; charset=utf-8</c> suffix) to match the official client exactly, while
+    /// still encoding the payload as UTF-8.
+    /// </summary>
+    private static StringContent JsonBody(string json)
+    {
+        var content = new StringContent(json, Encoding.UTF8);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        return content;
+    }
+
+    /// <summary>An empty POST body: Content-Length 0, no Content-Type (matches Archon).</summary>
+    private static ByteArrayContent EmptyBody() => new(Array.Empty<byte>());
 
     public async Task<bool> LoginAsync(string email, string password)
     {
@@ -93,10 +184,11 @@ public class FFLogsService
             };
 
             var json = JsonSerializer.Serialize(payload);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-            
+
             Plugin.Log.Debug("[Login] Posting to /desktop-client/log-in...");
-            var response = await HttpClient.PostAsync("/desktop-client/log-in", content);
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/desktop-client/log-in") { Content = JsonBody(json) };
+            ApplyArchonHeaders(request, RequestKind.JsonApi);
+            var response = await HttpClient.SendAsync(request);
             
             Plugin.Log.Debug($"[Login] Response status: {response.StatusCode}");
             var responseBody = await response.Content.ReadAsStringAsync();
@@ -115,7 +207,16 @@ public class FFLogsService
                 var user = doc.RootElement.GetProperty("user");
                 Username = user.GetProperty("userName").GetString();
                 Plugin.Log.Information($"[Login] Logged in as: {Username}");
-                
+
+                // Account feature flags (sibling of "user" in the response).
+                RealTimeLiveLoggingEnabled = false;
+                if (doc.RootElement.TryGetProperty("enabledFeatures", out var features) &&
+                    features.TryGetProperty("realTimeLiveLogging", out var rtll))
+                {
+                    RealTimeLiveLoggingEnabled = rtll.ValueKind == JsonValueKind.True;
+                }
+                Plugin.Log.Information($"[Login] realTimeLiveLogging={RealTimeLiveLoggingEnabled}");
+
                 // Parse guilds
                 Guilds.Clear();
                 if (user.TryGetProperty("guilds", out var guildsArray))
@@ -146,9 +247,14 @@ public class FFLogsService
                 Plugin.Log.Debug($"[Login] Cookie: {c.Name}");
             }
 
-            // Refresh the session token (required after login)
+            // Refresh the session token (required after login). The Archon app moved
+            // this from /desktop-client/token to /desktop-client/token/v2; the old path
+            // is disabled. The v2 response body is a JWT used for websocket features we
+            // don't need — we call it only for the XSRF/session cookie refresh side effect.
             Plugin.Log.Debug("[Login] Refreshing session token...");
-            var tokenResponse = await HttpClient.PostAsync("/desktop-client/token", null);
+            using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, "/desktop-client/token/v2") { Content = EmptyBody() };
+            ApplyArchonHeaders(tokenRequest, RequestKind.EmptyPost);
+            var tokenResponse = await HttpClient.SendAsync(tokenRequest);
             Plugin.Log.Debug($"[Login] Token refresh status: {tokenResponse.StatusCode}");
             
             if (tokenResponse.StatusCode != System.Net.HttpStatusCode.OK)
@@ -182,7 +288,10 @@ public class FFLogsService
         var payload = new Dictionary<string, object?>
         {
             ["clientVersion"] = CLIENT_VERSION,
-            ["parserVersion"] = PARSER_VERSION,
+            // Advertise the version reported by the actual parser bundle (detected on
+            // download) rather than a hardcoded constant, so this stays correct across
+            // upstream parser bumps without a code change.
+            ["parserVersion"] = plugin.ParserService.ParserVersion,
             ["startTime"] = ts,
             ["endTime"] = ts,
             ["guildId"] = string.IsNullOrEmpty(guildId) ? null : int.Parse(guildId),
@@ -194,10 +303,11 @@ public class FFLogsService
         };
 
         var json = JsonSerializer.Serialize(payload);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
 
         Plugin.Log.Debug($"[CreateReport] POST /desktop-client/create-report: {json}");
-        var response = await HttpClient.PostAsync("/desktop-client/create-report", content);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/desktop-client/create-report") { Content = JsonBody(json) };
+        ApplyArchonHeaders(request, RequestKind.JsonApi);
+        var response = await HttpClient.SendAsync(request);
         
         var responseBody = await response.Content.ReadAsStringAsync();
         Plugin.Log.Debug($"[CreateReport] Response: {response.StatusCode} - {responseBody}");
@@ -224,6 +334,10 @@ public class FFLogsService
 
     public async Task<string> UploadLogAsync(string logPath, int region, int visibility, string? guildId, string description)
     {
+        // 0. Make sure the parser bundle (and thus its parserVersion) is known before
+        //    create-report advertises it. Cheap when the bundle is already cached.
+        await plugin.ParserService.EnsureParserVersionAsync();
+
         // 1. Create report
         var reportCode = await CreateReportAsync(logPath, description, visibility, region, guildId);
 
@@ -267,9 +381,9 @@ public class FFLogsService
 
             try
             {
-                await plugin.ParserService.StartLiveLogAsync(logDirectory, region, uploadPreviousFights, async (masterData, fight, segmentId, startTime, endTime) =>
+                await plugin.ParserService.StartLiveLogAsync(logDirectory, region, uploadPreviousFights, async (masterData, fight, segmentId, startTime, endTime, inProgressEventCount) =>
                 {
-                    // Create report lazily on first fight
+                    // Create report lazily on first fight (or first in-progress push)
                     if (reportCode == null)
                     {
                         Plugin.Log.Information("[LiveLog] First fight detected - creating report...");
@@ -281,9 +395,13 @@ public class FFLogsService
                         plugin.ParserService.SetReportCode(reportCode);
                     }
 
-                    await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData, segmentId));
-                    await WithRetryAsync(() => UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true));
-                    LiveFightCount++;
+                    // A non-zero inProgressEventCount marks a provisional (real-time)
+                    // segment for a fight that hasn't committed yet.
+                    bool isRealTime = inProgressEventCount > 0;
+                    await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData, segmentId, isRealTime));
+                    await WithRetryAsync(() => UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true, isRealTime: isRealTime, inProgressEventCount: inProgressEventCount));
+                    // Only count a fight once it's finalized (not on provisional re-uploads).
+                    if (inProgressEventCount == 0) LiveFightCount++;
                 }, liveLogCts.Token);
             }
             catch (OperationCanceledException)
@@ -463,8 +581,7 @@ public class FFLogsService
         {
             Content = content
         };
-        request.Headers.Accept.Clear();
-        request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+        ApplyArchonHeaders(request, RequestKind.Multipart);
 
         var response = await HttpClient.SendAsync(request);
         response.EnsureSuccessStatusCode();
@@ -472,7 +589,7 @@ public class FFLogsService
         Plugin.Log.Debug($"Master table uploaded for {reportCode}");
     }
 
-    private async Task UploadSegmentAsync(string reportCode, FightData fight, int segmentId, long startTime, long endTime, bool isLive = false)
+    private async Task UploadSegmentAsync(string reportCode, FightData fight, int segmentId, long startTime, long endTime, bool isLive = false, bool isRealTime = false, int inProgressEventCount = 0)
     {
         // Format events: header + count + events. Use the parser-provided eventCount
         // (numeric eventId delta, not line count) to match the official client exactly.
@@ -496,8 +613,8 @@ public class FFLogsService
             endTime,
             mythic = 0,
             isLiveLog = isLive,
-            isRealTime = false,
-            inProgressEventCount = 0,
+            isRealTime,
+            inProgressEventCount,
             segmentId
         });
 
@@ -515,8 +632,7 @@ public class FFLogsService
         {
             Content = formContent
         };
-        request.Headers.Accept.Clear();
-        request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+        ApplyArchonHeaders(request, RequestKind.Multipart);
 
         var response = await HttpClient.SendAsync(request);
         response.EnsureSuccessStatusCode();
@@ -530,7 +646,9 @@ public class FFLogsService
         {
             await WithRetryAsync(async () =>
             {
-                var response = await HttpClient.PostAsync($"/desktop-client/terminate-report/{reportCode}", null);
+                using var request = new HttpRequestMessage(HttpMethod.Post, $"/desktop-client/terminate-report/{reportCode}") { Content = EmptyBody() };
+                ApplyArchonHeaders(request, RequestKind.EmptyPost);
+                var response = await HttpClient.SendAsync(request);
                 if (!response.IsSuccessStatusCode)
                 {
                     throw new HttpRequestException($"Terminate failed with status {response.StatusCode}");
