@@ -23,8 +23,23 @@ public class FFLogsService
     // Must match a currently-supported Archon App Lite version. FFLogs deprecated the
     // standalone "FFLogsUploader" client and now gates the desktop-client endpoints on
     // the Archon app's version/User-Agent — an out-of-date value is rejected server-side.
-    private const string CLIENT_VERSION = "9.3.85";
+    // Values below are taken from Archon App Lite 9.5.0 (Chromium 142 / Electron 39.8.10);
+    // re-derive from the app's asar (package.json version + a captured request) on updates.
+    private const string CLIENT_VERSION = "9.5.0";
+    private const string CHROME_VERSION = "142.0.7444.265";
+    private const string ELECTRON_VERSION = "39.8.10";
+    // Chromium's brand list changes format between major versions — 142 emits
+    // "Not_A Brand";v="99" where 138 emitted "Not)A;Brand";v="8". Copy verbatim.
+    private const string SEC_CH_UA = "\"Not_A Brand\";v=\"99\", \"Chromium\";v=\"142\"";
     private const int MaxRetries = 3;
+
+    /// <summary>
+    /// create-report "logMode" values, added in Archon 9.5.0.
+    /// The server uses these to distinguish how a report was produced.
+    /// </summary>
+    private const int LogModeLive = 1;      // liveLogOperation, not auto-log
+    private const int LogModeBulkFile = 2;  // uploadALogOperation (a log file on disk)
+    // 3 = auto-log live logging; the plugin has no auto-log mode.
     
     private readonly Plugin plugin;
     private readonly CookieContainer cookies;
@@ -84,7 +99,7 @@ public class FFLogsService
         // headers vary by request type (JSON API vs multipart upload vs iframe
         // navigation vs no-cors script) and are applied per request in
         // ApplyArchonHeaders so each call matches the real client byte-for-byte.
-        HttpClient.DefaultRequestHeaders.Add("User-Agent", $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ArchonAppLite/{CLIENT_VERSION} Chrome/138.0.7204.251 Electron/37.9.0 Safari/537.36");
+        HttpClient.DefaultRequestHeaders.Add("User-Agent", $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ArchonAppLite/{CLIENT_VERSION} Chrome/{CHROME_VERSION} Electron/{ELECTRON_VERSION} Safari/537.36");
         HttpClient.DefaultRequestHeaders.Add("Accept-Language", "en-US");
         HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Site", "cross-site");
         HttpClient.DefaultRequestHeaders.Add("Sec-Fetch-Storage-Access", "active");
@@ -93,7 +108,7 @@ public class FFLogsService
     /// <summary>
     /// The kinds of request the Archon uploader makes, each with its own header
     /// fingerprint (Accept, Sec-Fetch-Mode/Dest, and whether sec-ch-ua* client hints
-    /// are present). Derived from Fiddler captures of Archon App Lite 9.3.85.
+    /// are present). Derived from Fiddler captures of Archon App Lite 9.5.0.
     /// </summary>
     public enum RequestKind
     {
@@ -122,7 +137,7 @@ public class FFLogsService
         // the parser page.
         if (kind != RequestKind.ParserPage)
         {
-            request.Headers.TryAddWithoutValidation("sec-ch-ua", "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\"");
+            request.Headers.TryAddWithoutValidation("sec-ch-ua", SEC_CH_UA);
             request.Headers.TryAddWithoutValidation("sec-ch-ua-mobile", "?0");
             request.Headers.TryAddWithoutValidation("sec-ch-ua-platform", "\"Windows\"");
         }
@@ -281,10 +296,10 @@ public class FFLogsService
         // No session fields to clear — XSRF is managed by the handler
     }
 
-    public async Task<string> CreateReportAsync(string filename, string description, int visibility, int region, string? guildId = null)
+    public async Task<string> CreateReportAsync(string filename, string description, int visibility, int region, string? guildId = null, int logMode = LogModeBulkFile)
     {
         var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        
+
         var payload = new Dictionary<string, object?>
         {
             ["clientVersion"] = CLIENT_VERSION,
@@ -299,7 +314,9 @@ public class FFLogsService
             ["serverOrRegion"] = region,
             ["visibility"] = visibility,
             ["reportTagId"] = null,
-            ["description"] = description
+            ["description"] = description,
+            // Added in Archon 9.5.0 — tells the server how this report was produced.
+            ["logMode"] = logMode
         };
 
         var json = JsonSerializer.Serialize(payload);
@@ -339,7 +356,7 @@ public class FFLogsService
         await plugin.ParserService.EnsureParserVersionAsync();
 
         // 1. Create report
-        var reportCode = await CreateReportAsync(logPath, description, visibility, region, guildId);
+        var reportCode = await CreateReportAsync(logPath, description, visibility, region, guildId, LogModeBulkFile);
 
         // 2. Process log with parser — returns one FightUpload per fight, each with a
         // slim master table scoped to that fight only (matches official client output).
@@ -350,7 +367,7 @@ public class FFLogsService
         {
             int segmentId = i + 1;
             var u = uploads[i];
-            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, u.MasterTable, segmentId));
+            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, u.Master, segmentId));
             await WithRetryAsync(() => UploadSegmentAsync(reportCode, u.Fight, segmentId, u.FightStartTime, u.FightEndTime));
         }
 
@@ -387,7 +404,7 @@ public class FFLogsService
                     if (reportCode == null)
                     {
                         Plugin.Log.Information("[LiveLog] First fight detected - creating report...");
-                        reportCode = await CreateReportAsync("live.log", description, visibility, region, guildId);
+                        reportCode = await CreateReportAsync("live.log", description, visibility, region, guildId, LogModeLive);
                         CurrentReportCode = reportCode;
 
                         // Inform the parser so subsequent collect-master-info calls
@@ -554,7 +571,7 @@ public class FFLogsService
         return content;
     }
 
-    private async Task UploadMasterTableAsync(string reportCode, string masterTableContent, int segmentId = 1, bool isRealTime = false)
+    private async Task UploadMasterTableAsync(string reportCode, ParserService.MasterInfo master, int segmentId = 1, bool isRealTime = false)
     {
         using var memoryStream = new MemoryStream();
         using (var zipArchive = new System.IO.Compression.ZipArchive(memoryStream, System.IO.Compression.ZipArchiveMode.Create, true))
@@ -562,7 +579,7 @@ public class FFLogsService
             var entry = zipArchive.CreateEntry("log.txt");
             using var entryStream = entry.Open();
             using var writer = new StreamWriter(entryStream);
-            await writer.WriteAsync(masterTableContent);
+            await writer.WriteAsync(master.Table);
         }
 
         var zipBytes = memoryStream.ToArray();
@@ -573,9 +590,12 @@ public class FFLogsService
         content.Headers.Remove("Content-Type");
         content.Headers.TryAddWithoutValidation("Content-Type", $"multipart/form-data; boundary={boundary}");
 
+        // Field order matches Archon 9.5.0: segmentId, isRealTime, logfile, players.
         content.Add(CreateStringPart("segmentId", segmentId.ToString()));
         content.Add(CreateStringPart("isRealTime", isRealTime.ToString().ToLower()));
         content.Add(CreateFilePart("logfile", "blob", zipBytes));
+        // "players" roster added in Archon 9.5.0 / parser 3075.
+        content.Add(CreateStringPart("players", master.Players));
 
         using var request = new HttpRequestMessage(HttpMethod.Post, $"/desktop-client/set-report-master-table/{reportCode}")
         {

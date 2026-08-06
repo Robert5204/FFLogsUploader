@@ -53,7 +53,7 @@ public class ParserService : IDisposable
     // always advertises the same parserVersion the current parser bundle reports —
     // matching how the Archon app queries the parser via `get-parser-version` rather
     // than hardcoding it.
-    private const int FallbackParserVersion = 2075;
+    private const int FallbackParserVersion = 3075;
 
     private readonly Plugin plugin;
     private string? parserBundlePath;
@@ -128,13 +128,16 @@ public class ParserService : IDisposable
             "XIVLauncher", "pluginConfigs", "FFLogsPlugin"
         );
         Directory.CreateDirectory(cacheDir);
-        // Cache key bumped when the upstream parser changes (parserVersion 2075).
-        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_v8_v3.js");
+        // Cache key bumped when the upstream parser changes (now parserVersion 3075).
+        // Bumping it forces a re-download rather than waiting out the 24h expiry —
+        // required here because 3075 introduced the playersString roster that the
+        // master-table upload now sends as its "players" field.
+        parserBundlePath = Path.Combine(cacheDir, "fflogs_parser_v8_v4.js");
 
         // Best-effort cleanup of older cache files so they don't accumulate.
         try
         {
-            foreach (var stale in new[] { "fflogs_parser_v8.js", "fflogs_parser_v8_v2.js" })
+            foreach (var stale in new[] { "fflogs_parser_v8.js", "fflogs_parser_v8_v2.js", "fflogs_parser_v8_v3.js", "fflogs_parser_bundle.js" })
             {
                 var p = Path.Combine(cacheDir, stale);
                 if (File.Exists(p)) File.Delete(p);
@@ -498,10 +501,18 @@ public class ParserService : IDisposable
     }
 
     /// <summary>
+    /// The two pieces of a master-table upload: the compressed master table itself and
+    /// the newline-delimited "Name|Server" player roster. Archon 9.5.0 (parser 3075)
+    /// added the roster as a separate <c>players</c> form field sourced from the
+    /// parser's <c>playersString</c>.
+    /// </summary>
+    public record MasterInfo(string Table, string Players);
+
+    /// <summary>
     /// One uploadable fight: events + the slim per-fight master table that scopes only
     /// to that fight's actors/abilities. Matches the official client's per-segment upload.
     /// </summary>
-    public record FightUpload(string MasterTable, FightData Fight, long FightStartTime, long FightEndTime);
+    public record FightUpload(MasterInfo Master, FightData Fight, long FightStartTime, long FightEndTime);
 
     /// <summary>
     /// Process a log file using the embedded V8 parser.
@@ -690,8 +701,11 @@ public class ParserService : IDisposable
     ///     - Line: {lastAssigned*ID} (from master data)
     ///     - Raw: {sectionString} (already newline-delimited)
     ///   Sections: actors, abilities, tuples, pets.
+    ///
+    /// The parser's separate <c>playersString</c> roster (parser 3075+) is returned
+    /// alongside it — it is NOT part of the table, it uploads as its own form field.
     /// </summary>
-    private string BuildMasterTableString(JsonElement? fightsData, JsonElement masterData)
+    private MasterInfo BuildMasterTableString(JsonElement? fightsData, JsonElement masterData)
     {
         var sb = new StringBuilder();
 
@@ -733,8 +747,17 @@ public class ParserService : IDisposable
         }
 
         var result = sb.ToString();
-        Plugin.Log.Debug($"[Parser] Master table: {result.Length} chars");
-        return result;
+
+        // Separate form field, not part of the table. Absent on parsers older than 3075,
+        // in which case we send an empty string (the field is still posted, as Archon does).
+        var players = masterData.TryGetProperty("playersString", out var pl) && pl.ValueKind == JsonValueKind.String
+            ? pl.GetString() ?? ""
+            : "";
+        if (players.Length == 0)
+            Plugin.Log.Debug("[Parser] No playersString in master info (parser older than 3075?)");
+
+        Plugin.Log.Debug($"[Parser] Master table: {result.Length} chars, players: {players.Length} chars");
+        return new MasterInfo(result, players);
     }
 
     /// <summary>
@@ -954,7 +977,7 @@ public class ParserService : IDisposable
         string logDirectory,
         int region,
         bool uploadPreviousFights,
-        Func<string, FightData, int, long, long, int, Task> onFightComplete,
+        Func<MasterInfo, FightData, int, long, long, int, Task> onFightComplete,
         CancellationToken cancellationToken = default)
     {
         await StartParserAsync();
@@ -1264,7 +1287,7 @@ public class ParserService : IDisposable
         }
     }
 
-    private async Task<int> CheckForFightsAsync(int lastFightCount, Func<string, FightData, int, long, long, int, Task> onFightComplete, bool pushFightIfNeeded = false)
+    private async Task<int> CheckForFightsAsync(int lastFightCount, Func<MasterInfo, FightData, int, long, long, int, Task> onFightComplete, bool pushFightIfNeeded = false)
     {
         var fightsResponses = SendMessageAndCollect(new
         {
@@ -1356,7 +1379,7 @@ public class ParserService : IDisposable
     /// once it commits (same segmentId, inProgressEventCount 0).
     /// </summary>
     private async Task<int> CheckInProgressFightAsync(int committedFightCount, int lastInProgressEventCount,
-        Func<string, FightData, int, long, long, int, Task> onFightComplete)
+        Func<MasterInfo, FightData, int, long, long, int, Task> onFightComplete)
     {
         var responses = SendMessageAndCollect(new
         {
