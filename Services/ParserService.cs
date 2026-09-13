@@ -23,7 +23,6 @@ namespace FFLogsPlugin.Services;
 /// </summary>
 public class ParserService : IDisposable
 {
-    private const string FFLOGS_URL = "https://www.fflogs.com";
 
     // Configurable timing constants
     private const int LiveLogPollIntervalMs = 500;
@@ -167,7 +166,7 @@ public class ParserService : IDisposable
         {
             // Fetch the parser page
             var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var parserPageUrl = $"{FFLOGS_URL}/desktop-client/parser?id=1&ts={ts}&gameContentDetectionEnabled={ParserGameContentDetectionEnabled}&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
+            var parserPageUrl = $"{plugin.FFLogsService.FflogsBaseUrl}/desktop-client/parser?id=1&ts={ts}&gameContentDetectionEnabled={ParserGameContentDetectionEnabled}&metersEnabled={ParserMetersEnabled}&liveFightDataEnabled={ParserLiveFightDataEnabled}";
 
             // Archon loads this page as an iframe navigation, not a fetch — match that
             // request fingerprint (navigate/iframe, no sec-ch-ua* client hints).

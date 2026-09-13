@@ -29,11 +29,11 @@ public class ParseViewerWindow : Window, IDisposable
     private string? errorMessage = null;
 
     // Sort state
-    private int sortColumnIndex = 5; // Default sort by Parse %
+    private int sortColumnIndex = 5; // Default sort by 解析百分比
     private bool sortAscending = false;
 
     public ParseViewerWindow(Plugin plugin)
-        : base("Parse Viewer##FFLogsParseViewer", ImGuiWindowFlags.NoCollapse)
+        : base("解析查看器##FFLogsParseViewer", ImGuiWindowFlags.NoCollapse)
     {
         this.plugin = plugin;
 
@@ -92,11 +92,11 @@ public class ParseViewerWindow : Window, IDisposable
     private void DrawApiSetup()
     {
         ImGui.Spacing();
-        ImGui.TextColored(new Vector4(1.0f, 0.85f, 0.3f, 1.0f), "FFLogs API Setup Required");
+        ImGui.TextColored(new Vector4(1.0f, 0.85f, 0.3f, 1.0f), "需要配置 FFLogs API");
         ImGui.Spacing();
         ImGui.TextWrapped(
-            "To view parses, you need an FFLogs API client. " +
-            "Create one at fflogs.com/api/clients (free), then enter the credentials below.");
+            "查看解析需要 FFLogs API 客户端。" +
+            "请在 cn.fflogs.com/api/clients 免费创建，然后在下方输入凭据。");
         ImGui.Spacing();
 
         if (string.IsNullOrEmpty(apiClientId) && !string.IsNullOrEmpty(plugin.Configuration.ApiClientId))
@@ -104,12 +104,12 @@ public class ParseViewerWindow : Window, IDisposable
         if (string.IsNullOrEmpty(apiClientSecret) && !string.IsNullOrEmpty(plugin.Configuration.ApiClientSecret))
             apiClientSecret = plugin.Configuration.ApiClientSecret;
 
-        ImGui.Text("Client ID:");
+        ImGui.Text("客户端 ID：");
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##apiClientId", ref apiClientId, 256);
 
         ImGui.Spacing();
-        ImGui.Text("Client Secret:");
+        ImGui.Text("客户端密钥：");
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##apiClientSecret", ref apiClientSecret, 256, ImGuiInputTextFlags.Password);
 
@@ -119,7 +119,7 @@ public class ParseViewerWindow : Window, IDisposable
         var canSave = !string.IsNullOrWhiteSpace(apiClientId) && !string.IsNullOrWhiteSpace(apiClientSecret);
         if (!canSave) ImGui.BeginDisabled();
 
-        if (ImGui.Button("Save & Connect", new Vector2(-1, 35)))
+        if (ImGui.Button("保存并连接", new Vector2(-1, 35)))
         {
             plugin.Configuration.ApiClientId = apiClientId.Trim();
             plugin.Configuration.ApiClientSecret = apiClientSecret.Trim();
@@ -138,7 +138,7 @@ public class ParseViewerWindow : Window, IDisposable
 
     private void DrawReportHeader()
     {
-        ImGui.Text("Report:");
+        ImGui.Text("报告：");
         ImGui.SameLine();
 
         ImGui.SetNextItemWidth(150);
@@ -148,12 +148,12 @@ public class ParseViewerWindow : Window, IDisposable
         if (isLoadingFights)
         {
             ImGui.BeginDisabled();
-            ImGui.Button("Loading...");
+            ImGui.Button("加载中...");
             ImGui.EndDisabled();
         }
         else
         {
-            if (ImGui.Button("Fetch"))
+            if (ImGui.Button("获取"))
             {
                 if (!string.IsNullOrWhiteSpace(reportCode))
                     _ = LoadFightsAsync();
@@ -161,13 +161,13 @@ public class ParseViewerWindow : Window, IDisposable
         }
 
         ImGui.SameLine();
-        if (ImGui.Button("Open on FFLogs") && !string.IsNullOrEmpty(reportCode))
+        if (ImGui.Button("在 FFLogs 中打开") && !string.IsNullOrEmpty(reportCode))
         {
             try
             {
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
                 {
-                    FileName = $"https://www.fflogs.com/reports/{reportCode}",
+                    FileName = $"{plugin.FFLogsService.FflogsBaseUrl}/reports/{reportCode}",
                     UseShellExecute = true,
                 });
             }
@@ -183,13 +183,13 @@ public class ParseViewerWindow : Window, IDisposable
         if (fights.Count == 0)
         {
             if (isLoadingFights)
-                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "Loading fights...");
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "正在加载战斗...");
             else if (!string.IsNullOrEmpty(reportCode) && errorMessage == null)
-                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "No fights loaded. Click Fetch to load.");
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "暂无战斗记录，点击“获取”加载。");
             return;
         }
 
-        ImGui.Text("Select a fight:");
+        ImGui.Text("选择战斗：");
 
         var availH = ImGui.GetContentRegionAvail().Y - 25;
         var listHeight = Math.Max(100, Math.Min(availH, fights.Count * ImGui.GetTextLineHeightWithSpacing() + 8));
@@ -227,17 +227,17 @@ public class ParseViewerWindow : Window, IDisposable
 
         var fightName = fights[selectedFightIndex].DisplayString;
         var sidePanelOpen = true;
-        if (ImGui.Begin($"Parses — {fightName}##ParseSidePanel", ref sidePanelOpen, ImGuiWindowFlags.NoCollapse))
+        if (ImGui.Begin($"解析 — {fightName}##ParseSidePanel", ref sidePanelOpen, ImGuiWindowFlags.NoCollapse))
         {
             if (isLoadingParses)
             {
-                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "Loading parses...");
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "正在加载解析...");
             }
             else if (parses.Count == 0)
             {
                 ImGui.TextColored(new Vector4(1.0f, 0.85f, 0.3f, 1.0f),
-                    "No parse data yet. Report may still be processing.");
-                if (ImGui.Button("Refresh"))
+                    "暂无解析数据，报告可能仍在处理中。");
+                if (ImGui.Button("刷新"))
                     _ = LoadParsesAsync(fights[selectedFightIndex].Id);
             }
             else
@@ -253,7 +253,7 @@ public class ParseViewerWindow : Window, IDisposable
 
     private void DrawParsesTable()
     {
-        // Always show 6 columns: Name, Job, DPS, rDPS, aDPS, Parse %
+        // Always show 6 columns: 名称, 职业, DPS, rDPS, aDPS, 解析百分比
         var tableFlags = ImGuiTableFlags.Borders
                        | ImGuiTableFlags.RowBg
                        | ImGuiTableFlags.SizingStretchProp
@@ -262,12 +262,12 @@ public class ParseViewerWindow : Window, IDisposable
 
         if (ImGui.BeginTable("##ParsesTable", 6, tableFlags))
         {
-            ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.None, 3.0f);
-            ImGui.TableSetupColumn("Job", ImGuiTableColumnFlags.None, 1.5f);
+            ImGui.TableSetupColumn("名称", ImGuiTableColumnFlags.None, 3.0f);
+            ImGui.TableSetupColumn("职业", ImGuiTableColumnFlags.None, 1.5f);
             ImGui.TableSetupColumn("DPS", ImGuiTableColumnFlags.None, 1.2f);
             ImGui.TableSetupColumn("rDPS", ImGuiTableColumnFlags.None, 1.2f);
             ImGui.TableSetupColumn("aDPS", ImGuiTableColumnFlags.None, 1.2f);
-            ImGui.TableSetupColumn("Parse %", ImGuiTableColumnFlags.DefaultSort | ImGuiTableColumnFlags.PreferSortDescending, 1.0f);
+            ImGui.TableSetupColumn("解析百分比", ImGuiTableColumnFlags.DefaultSort | ImGuiTableColumnFlags.PreferSortDescending, 1.0f);
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableHeadersRow();
 
@@ -286,7 +286,7 @@ public class ParseViewerWindow : Window, IDisposable
             {
                 ImGui.TableNextRow();
 
-                // Name
+                // 名称
                 ImGui.TableNextColumn();
                 ImGui.Text(parse.Name);
                 if (!string.IsNullOrEmpty(parse.Server))
@@ -295,7 +295,7 @@ public class ParseViewerWindow : Window, IDisposable
                     ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1.0f), $"({parse.Server})");
                 }
 
-                // Job
+                // 职业
                 ImGui.TableNextColumn();
                 ImGui.Text(string.IsNullOrEmpty(parse.Spec) ? parse.Job : parse.Spec);
 
@@ -311,7 +311,7 @@ public class ParseViewerWindow : Window, IDisposable
                 ImGui.TableNextColumn();
                 DrawNumberCell(parse.Adps);
 
-                // Parse %
+                // 解析百分比
                 ImGui.TableNextColumn();
                 if (parse.ParsePercent.HasValue)
                 {
@@ -338,7 +338,7 @@ public class ParseViewerWindow : Window, IDisposable
 
     private void SortParses()
     {
-        // Columns: 0=Name, 1=Job, 2=DPS, 3=rDPS, 4=aDPS, 5=Parse%
+        // Columns: 0=名称, 1=职业, 2=DPS, 3=rDPS, 4=aDPS, 5=Parse%
         Func<FightParse, IComparable> keySelector = sortColumnIndex switch
         {
             0 => p => p.Name,
@@ -392,14 +392,14 @@ public class ParseViewerWindow : Window, IDisposable
             var (loadedFights, exportedSegments) = await plugin.FFLogsApiService.FetchReportFightsAsync(reportCode);
             fights = loadedFights;
             if (fights.Count == 0)
-                errorMessage = "No fights found. The report may still be processing.";
+                errorMessage = "未找到战斗，报告可能仍在处理中。";
             else if (exportedSegments == 0)
-                errorMessage = "Report is still being processed. Parses may not have percentiles yet.";
+                errorMessage = "报告仍在处理，解析百分位数据尚未生成。";
             Plugin.Log.Information($"[ParseViewer] Loaded {fights.Count} fights (exported={exportedSegments})");
         }
         catch (Exception ex)
         {
-            errorMessage = $"Failed to load fights: {ex.Message}";
+            errorMessage = $"加载战斗失败：{ex.Message}";
             Plugin.Log.Error(ex, "[ParseViewer] LoadFights failed");
         }
         finally
@@ -422,7 +422,7 @@ public class ParseViewerWindow : Window, IDisposable
         }
         catch (Exception ex)
         {
-            errorMessage = $"Failed to load parses: {ex.Message}";
+            errorMessage = $"加载解析失败：{ex.Message}";
             Plugin.Log.Error(ex, "[ParseViewer] LoadParses failed");
         }
         finally
@@ -431,3 +431,6 @@ public class ParseViewerWindow : Window, IDisposable
         }
     }
 }
+
+
+

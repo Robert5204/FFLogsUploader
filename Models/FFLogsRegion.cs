@@ -5,6 +5,7 @@ namespace FFLogsPlugin.Models;
 /// </summary>
 public enum FFLogsRegion
 {
+    CN = 7,
     NA = 1,
     EU = 2,
     JP = 3,
@@ -18,6 +19,7 @@ public static class FFLogsRegionExtensions
     /// </summary>
     public static string ToCode(this FFLogsRegion region) => region switch
     {
+        FFLogsRegion.CN => "CN",
         FFLogsRegion.NA => "NA",
         FFLogsRegion.EU => "EU",
         FFLogsRegion.JP => "JP",
@@ -28,12 +30,12 @@ public static class FFLogsRegionExtensions
     /// <summary>
     /// Display names for UI combo boxes, indexed by combo position.
     /// </summary>
-    public static readonly string[] DisplayNames = { "NA", "EU", "JP", "OC" };
+    public static readonly string[] DisplayNames = { "CN", "NA", "EU", "JP", "OC" };
 
     /// <summary>
     /// Maps combo index to the serverOrRegion API value.
     /// </summary>
-    public static readonly int[] ApiValues = { 1, 2, 3, 6 };
+    public static readonly int[] ApiValues = { 7, 1, 2, 3, 6 };
 
     /// <summary>
     /// Converts a combo index to the API region value.

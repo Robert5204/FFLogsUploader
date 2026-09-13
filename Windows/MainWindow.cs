@@ -28,10 +28,10 @@ public class MainWindow : Window, IDisposable
     private string statusMessage = string.Empty;
     private bool isProcessing = false;
 
-    private readonly string[] visibilities = { "Public", "Private", "Unlisted" };
+    private readonly string[] visibilities = { "公开", "私有", "不公开列出" };
 
     public MainWindow(Plugin plugin)
-        : base("FFLogs Uploader##FFLogsMain", ImGuiWindowFlags.NoCollapse)
+        : base("FFLogs 日志上传器##FFLogsMain", ImGuiWindowFlags.NoCollapse)
     {
         this.plugin = plugin;
 
@@ -79,13 +79,13 @@ public class MainWindow : Window, IDisposable
 
         if (ImGui.BeginTabBar("FFLogsTabs"))
         {
-            if (ImGui.BeginTabItem("Live Log"))
+            if (ImGui.BeginTabItem("实时记录"))
             {
                 DrawLiveLogTab();
                 ImGui.EndTabItem();
             }
 
-            if (ImGui.BeginTabItem("Upload a Log"))
+            if (ImGui.BeginTabItem("上传日志"))
             {
                 DrawUploadTab();
                 ImGui.EndTabItem();
@@ -97,10 +97,10 @@ public class MainWindow : Window, IDisposable
 
     private void DrawHeader()
     {
-        var displayName = plugin.FFLogsService.Username ?? plugin.Configuration.Email ?? "Unknown";
-        ImGui.Text($"Logged in as: {displayName}");
+        var displayName = plugin.FFLogsService.Username ?? plugin.Configuration.Email ?? "未知";
+        ImGui.Text($"当前账号：{displayName}");
         ImGui.SameLine(ImGui.GetWindowWidth() - 80);
-        if (ImGui.Button("Log Out"))
+        if (ImGui.Button("退出登录"))
         {
             plugin.FFLogsService.Logout();
             plugin.ShowLoginWindow();
@@ -110,7 +110,7 @@ public class MainWindow : Window, IDisposable
     private void DrawLiveLogTab()
     {
         ImGui.Spacing();
-        ImGui.Text("Choose the directory that the ACT FFXIV plug-in writes logs to:");
+        ImGui.Text("选择 ACT FFXIV 插件写入日志的目录：");
         ImGui.SetNextItemWidth(-80);
         
         if (plugin.FFLogsService.IsLiveLogging)
@@ -118,10 +118,10 @@ public class MainWindow : Window, IDisposable
         
         ImGui.InputText("##logdir", ref logPath, 512);
         ImGui.SameLine();
-        if (ImGui.Button("Browse##dir"))
+        if (ImGui.Button("浏览##dir"))
         {
             fileDialogManager.OpenFolderDialog(
-                "Select Log Directory",
+                "选择日志目录",
                 (success, path) =>
                 {
                     if (success && !string.IsNullOrEmpty(path))
@@ -141,7 +141,13 @@ public class MainWindow : Window, IDisposable
         DrawSharedOptions();
         ImGui.Spacing();
 
-        ImGui.Checkbox("Include the Entire File in the Report", ref uploadPreviousFights);
+        ImGui.Checkbox("将整个文件包含在报告中", ref uploadPreviousFights);
+        var autoStartLiveLogging = plugin.Configuration.AutoStartLiveLogging;
+        if (ImGui.Checkbox(Loc.T("Start live logging automatically after login", "登录后自动开始实时上传"), ref autoStartLiveLogging))
+        {
+            plugin.Configuration.AutoStartLiveLogging = autoStartLiveLogging;
+            plugin.Configuration.Save();
+        }
         
         if (plugin.FFLogsService.IsLiveLogging)
             ImGui.EndDisabled();
@@ -152,14 +158,14 @@ public class MainWindow : Window, IDisposable
         {
             ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1.0f), 
                 $"● Live logging active - {plugin.FFLogsService.LiveFightCount} fight(s) uploaded");
-            ImGui.Text($"Report: {plugin.FFLogsService.CurrentReportCode ?? "unknown"}");
+            ImGui.Text($"报告：{plugin.FFLogsService.CurrentReportCode ?? "未知"}");
             ImGui.Spacing();
             
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.7f, 0.2f, 0.2f, 1.0f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.8f, 0.3f, 0.3f, 1.0f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.9f, 0.1f, 0.1f, 1.0f));
             
-            if (ImGui.Button("Stop Live Logging", new Vector2(-1, 40)))
+            if (ImGui.Button("停止实时记录", new Vector2(-1, 40)))
             {
                 plugin.FFLogsService.StopLiveLog();
             }
@@ -169,7 +175,7 @@ public class MainWindow : Window, IDisposable
             if (plugin.FFLogsService.LiveFightCount > 0 && !string.IsNullOrEmpty(plugin.FFLogsService.CurrentReportCode))
             {
                 ImGui.Spacing();
-                if (ImGui.Button("View Parses", new Vector2(-1, 30)))
+                if (ImGui.Button("查看解析", new Vector2(-1, 30)))
                 {
                     plugin.ShowParseViewer(plugin.FFLogsService.CurrentReportCode);
                 }
@@ -181,7 +187,7 @@ public class MainWindow : Window, IDisposable
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.3f, 0.6f, 0.3f, 1.0f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.1f, 0.7f, 0.1f, 1.0f));
             
-            if (ImGui.Button("Start Live Logging", new Vector2(-1, 40)))
+            if (ImGui.Button("开始实时记录", new Vector2(-1, 40)))
             {
                 StartLiveLog();
             }
@@ -193,15 +199,15 @@ public class MainWindow : Window, IDisposable
     private void DrawUploadTab()
     {
         ImGui.Spacing();
-        ImGui.Text("Choose the file you want to upload:");
+        ImGui.Text("选择要上传的文件：");
         ImGui.SetNextItemWidth(-80);
         ImGui.InputText("##logfile", ref logPath, 512);
         ImGui.SameLine();
-        if (ImGui.Button("Browse##file"))
+        if (ImGui.Button("浏览##file"))
         {
             fileDialogManager.OpenFileDialog(
-                "Select Log File",
-                "Log files{.log},All files{.*}",
+                "选择日志文件",
+                "日志文件{.log},所有文件{.*}",
                 (success, paths) =>
                 {
                     if (success && paths.Count > 0)
@@ -215,16 +221,16 @@ public class MainWindow : Window, IDisposable
         DrawSharedOptions();
         ImGui.Spacing();
 
-        DrawGoButton("Go!", StartUpload);
+        DrawGoButton("开始", StartUpload);
 
         DrawStatus();
     }
 
     private void DrawSharedOptions()
     {
-        ImGui.Text("Choose the guild you want to upload to:");
+        ImGui.Text("选择上传目标公会：");
         
-        var guildList = new List<(string? Id, string Name)> { (null, "Personal Logs") };
+        var guildList = new List<(string? Id, string Name)> { (null, "个人日志") };
         foreach (var guild in plugin.FFLogsService.Guilds)
         {
             guildList.Add((guild.Id, guild.Name));
@@ -252,7 +258,7 @@ public class MainWindow : Window, IDisposable
         ImGui.Combo("##visibility", ref selectedVisibility, visibilities, visibilities.Length);
 
         ImGui.Spacing();
-        ImGui.Text("Enter a description for the report:");
+        ImGui.Text("输入报告描述：");
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##description", ref description, 256);
     }
@@ -295,7 +301,7 @@ public class MainWindow : Window, IDisposable
         if (isProcessing) ImGui.BeginDisabled();
 
         ImGui.SetCursorPosX(ImGui.GetWindowWidth() - 115);
-        if (ImGui.Button(isProcessing ? "Processing..." : label, new Vector2(100, 30)))
+        if (ImGui.Button(isProcessing ? "处理中..." : label, new Vector2(100, 30)))
             action();
 
         if (isProcessing) ImGui.EndDisabled();
@@ -308,11 +314,11 @@ public class MainWindow : Window, IDisposable
             ImGui.Separator();
             ImGui.TextWrapped(statusMessage);
 
-            // Show View Parses button when upload is complete
-            if (statusMessage.StartsWith("Upload complete!") && plugin.FFLogsService.RecentReportCodes.Count > 0)
+            // Show 查看解析 button when upload is complete
+            if (statusMessage.StartsWith("上传完成！") && plugin.FFLogsService.RecentReportCodes.Count > 0)
             {
                 ImGui.Spacing();
-                if (ImGui.Button("View Parses##status", new Vector2(-1, 30)))
+                if (ImGui.Button("查看解析##status", new Vector2(-1, 30)))
                 {
                     plugin.ShowParseViewer(plugin.FFLogsService.RecentReportCodes[0]);
                 }
@@ -324,7 +330,7 @@ public class MainWindow : Window, IDisposable
     {
         if (string.IsNullOrWhiteSpace(logPath))
         {
-            statusMessage = "Please enter a log directory path first.";
+            statusMessage = "请先输入日志目录路径。";
             return;
         }
 
@@ -348,7 +354,7 @@ public class MainWindow : Window, IDisposable
         }
         catch (Exception ex)
         {
-            statusMessage = $"Error: {ex.Message}";
+            statusMessage = $"错误：{ex.Message}";
             Plugin.Log.Error(ex, "Live log failed");
         }
     }
@@ -357,7 +363,7 @@ public class MainWindow : Window, IDisposable
     {
         if (string.IsNullOrWhiteSpace(logPath))
         {
-            statusMessage = "Please select a log file first.";
+            statusMessage = "请先选择日志文件。";
             return;
         }
 
@@ -369,12 +375,12 @@ public class MainWindow : Window, IDisposable
 
         if (!System.IO.File.Exists(logPath))
         {
-            statusMessage = "No log files found in the specified directory.";
+            statusMessage = "指定目录中未找到日志文件。";
             return;
         }
 
         SaveConfig();
-        statusMessage = "Uploading...";
+        statusMessage = "上传中...";
         isProcessing = true;
         _ = DoUpload();
     }
@@ -385,11 +391,11 @@ public class MainWindow : Window, IDisposable
         {
             var guildId = GetSelectedGuildId();
             var reportCode = await plugin.FFLogsService.UploadLogAsync(logPath, FFLogsRegionExtensions.ComboIndexToApiValue(selectedRegion), selectedVisibility, guildId, description);
-            statusMessage = $"Upload complete! Report: {reportCode}";
+            statusMessage = $"上传完成！ Report: {reportCode}";
         }
         catch (Exception ex)
         {
-            statusMessage = $"Error: {ex.Message}";
+            statusMessage = $"错误：{ex.Message}";
             Plugin.Log.Error(ex, "Upload failed");
         }
         finally
@@ -412,3 +418,5 @@ public class MainWindow : Window, IDisposable
         plugin.Configuration.Save();
     }
 }
+
+

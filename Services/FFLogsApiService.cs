@@ -16,8 +16,8 @@ namespace FFLogsPlugin.Services;
 /// </summary>
 public class FFLogsApiService
 {
-    private const string TokenUrl = "https://www.fflogs.com/oauth/token";
-    private const string ApiUrl = "https://www.fflogs.com/api/v2/client";
+    private string TokenUrl => $"{plugin.FFLogsService.FflogsBaseUrl}/oauth/token";
+    private string ApiUrl => $"{plugin.FFLogsService.FflogsBaseUrl}/api/v2/client";
 
     private readonly Plugin plugin;
     private readonly HttpClient httpClient;

@@ -21,7 +21,9 @@ public class Configuration : IPluginConfiguration
 
     // Default settings
     public string LogDirectory { get; set; } = string.Empty;
-    public int Region { get; set; } = 1; // serverOrRegion API value: 1=NA, 2=EU, 3=JP, 6=OC
+    public int Region { get; set; } = 7; // serverOrRegion API value: CN=7, NA=1, EU=2, JP=3, OC=6
+    public bool UseCnFflogs { get; set; } = true;
+    public bool AutoStartLiveLogging { get; set; } = true;
     public int Visibility { get; set; } = 1; // 0=Public, 1=Private, 2=Unlisted
     public string? SelectedGuildId { get; set; } = null;
 
