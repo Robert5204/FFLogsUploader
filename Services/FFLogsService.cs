@@ -19,7 +19,7 @@ namespace FFLogsPlugin.Services;
 /// </summary>
 public class FFLogsService
 {
-    private const string FFLOGS_URL = "https://www.fflogs.com";
+    public string FflogsBaseUrl => plugin.Configuration.UseCnFflogs ? "https://cn.fflogs.com" : "https://www.fflogs.com";
     // Must match a currently-supported Archon App Lite version. FFLogs deprecated the
     // standalone "FFLogsUploader" client and now gates the desktop-client endpoints on
     // the Archon app's version/User-Agent — an out-of-date value is rejected server-side.
@@ -91,7 +91,7 @@ public class FFLogsService
         // is left in the project unused in case a future endpoint needs it.)
         HttpClient = new HttpClient(innerHandler)
         {
-            BaseAddress = new Uri(FFLOGS_URL)
+            BaseAddress = new Uri(FflogsBaseUrl)
         };
 
         // Only the headers Archon sends on *every* request live here. The Accept,
@@ -255,7 +255,7 @@ public class FFLogsService
             }
 
             // Get cookies from response
-            var responseCookies = cookies.GetCookies(new Uri(FFLOGS_URL));
+            var responseCookies = cookies.GetCookies(new Uri(FflogsBaseUrl));
             Plugin.Log.Debug($"[Login] Cookies received: {responseCookies.Count}");
             foreach (Cookie c in responseCookies)
             {

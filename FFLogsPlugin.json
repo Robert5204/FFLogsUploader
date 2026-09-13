@@ -1,8 +1,8 @@
 {
-    "Author": "Robert5204",
-    "Name": "FFLogs Uploader",
-    "Punchline": "Upload combat logs to FFLogs directly from the game",
-    "Description": "A plugin that allows you to upload ACT combat logs to FFLogs without leaving the game. Supports both live logging and manual log uploads.",
+    "Author": "keita",
+    "Name": "FFLogs 日志上传器",
+    "Punchline": "在游戏内上传 ACT 战斗日志到 CN FFLogs",
+    "Description": "在游戏内上传 ACT 战斗日志，支持实时记录和手动上传。默认连接 CN FFLogs。",
     "ApplicableVersion": "any",
     "Tags": [
         "fflogs",
@@ -14,8 +14,8 @@
         "utility"
     ],
     "InternalName": "FFLogsPlugin",
-    "AssemblyVersion": "1.3.0.0",
-    "RepoUrl": "https://github.com/Robert5204/FFLogsPlugin",
+    "AssemblyVersion": "1.3.0.1",
+    "RepoUrl": "https://github.com/zhui-zi/DalamudPlugins",
     "IconUrl": "",
     "DalamudApiLevel": 15
 }

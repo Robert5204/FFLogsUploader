@@ -5,6 +5,7 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using FFLogsPlugin.Windows;
 using FFLogsPlugin.Services;
+using FFLogsPlugin.Helpers;
 
 namespace FFLogsPlugin;
 
@@ -46,14 +47,14 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the FFLogs uploader window"
+            HelpMessage = "打开 FFLogs 日志上传器"
         });
 
         PluginInterface.UiBuilder.Draw += DrawUI;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
 
-        Log.Information("FFLogs Plugin loaded!");
+        Log.Information("FFLogs 日志上传器已加载");
         
         // Attempt auto-login if credentials are saved
         _ = CheckAutoLoginAsync();
@@ -66,8 +67,29 @@ public sealed class Plugin : IDalamudPlugin
             !string.IsNullOrEmpty(Configuration.Password))
         {
              Log.Information("Auto-login: Credentials found, attempting login...");
-             await FFLogsService.LoginAsync(Configuration.Email, Configuration.Password);
+             if (await FFLogsService.LoginAsync(Configuration.Email, Configuration.Password))
+                 await StartConfiguredLiveLoggingAsync();
         }
+    }
+
+    public async System.Threading.Tasks.Task StartConfiguredLiveLoggingAsync()
+    {
+        if (!Configuration.AutoStartLiveLogging || FFLogsService.IsLiveLogging)
+            return;
+
+        var directory = Configuration.LogDirectory;
+        if (string.IsNullOrWhiteSpace(directory) || !LogFileHelper.IsValidLogPath(directory))
+            directory = LogFileHelper.AutoDetectLogDirectory();
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            Log.Warning("Auto live logging skipped: ACT log directory was not found.");
+            return;
+        }
+
+        Configuration.LogDirectory = directory;
+        Configuration.Save();
+        Log.Information("Starting configured live logging.");
+        await FFLogsService.StartLiveLogAsync(directory, Configuration.Region, Configuration.Visibility, Configuration.SelectedGuildId, string.Empty, true);
     }
 
     public void Dispose()
@@ -127,3 +149,4 @@ public sealed class Plugin : IDalamudPlugin
         ParseViewerWindow.OpenWithReport(reportCode);
     }
 }
+

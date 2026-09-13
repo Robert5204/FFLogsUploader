@@ -16,7 +16,7 @@ public class LoginWindow : Window, IDisposable
     private bool isLoggingIn = false;
 
     public LoginWindow(Plugin plugin)
-        : base("FFLogs Login##FFLogsLogin", ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse)
+        : base("FFLogs 登录##FFLogsLogin", ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse)
     {
         this.plugin = plugin;
         
@@ -36,24 +36,24 @@ public class LoginWindow : Window, IDisposable
 
     public override void Draw()
     {
-        ImGui.Text("Log in to FFLogs");
+        ImGui.Text("登录 FFLogs");
         ImGui.Separator();
         ImGui.Spacing();
 
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##email", "Email", ref email, 256);
+        ImGui.InputTextWithHint("##email", "邮箱", ref email, 256);
 
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##password", "Password", ref password, 256, ImGuiInputTextFlags.Password);
+        ImGui.InputTextWithHint("##password", "密码", ref password, 256, ImGuiInputTextFlags.Password);
 
-        ImGui.Checkbox("Remember me", ref rememberMe);
+        ImGui.Checkbox("记住登录信息", ref rememberMe);
 
         ImGui.Spacing();
 
         if (isLoggingIn)
             ImGui.BeginDisabled();
 
-        if (ImGui.Button(isLoggingIn ? "Logging in..." : "Login", new Vector2(-1, 30)))
+        if (ImGui.Button(isLoggingIn ? "登录中..." : "登录", new Vector2(-1, 30)))
         {
             _ = DoLogin();
         }
@@ -64,7 +64,7 @@ public class LoginWindow : Window, IDisposable
         if (!string.IsNullOrEmpty(statusMessage))
         {
             ImGui.Spacing();
-            var color = statusMessage.StartsWith("Error") 
+            var color = statusMessage.StartsWith("错误") 
                 ? new Vector4(1, 0.3f, 0.3f, 1) 
                 : new Vector4(0.3f, 1, 0.3f, 1);
             ImGui.TextColored(color, statusMessage);
@@ -75,12 +75,12 @@ public class LoginWindow : Window, IDisposable
     {
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
         {
-            statusMessage = "Error: Please enter email and password";
+            statusMessage = "错误：请输入邮箱和密码";
             return;
         }
 
         isLoggingIn = true;
-        statusMessage = "Logging in...";
+        statusMessage = "登录中...";
 
         try
         {
@@ -102,17 +102,18 @@ public class LoginWindow : Window, IDisposable
                 }
                 plugin.Configuration.Save();
 
-                statusMessage = "Login successful!";
+                statusMessage = "登录成功！";
                 plugin.ShowMainWindow();
+                await plugin.StartConfiguredLiveLoggingAsync();
             }
             else
             {
-                statusMessage = "Error: Login failed. Check credentials.";
+                statusMessage = "错误：登录失败，请检查账号密码。";
             }
         }
         catch (Exception ex)
         {
-            statusMessage = $"Error: {ex.Message}";
+            statusMessage = $"错误：{ex.Message}";
             Plugin.Log.Error(ex, "Login failed");
         }
         finally
@@ -121,3 +122,4 @@ public class LoginWindow : Window, IDisposable
         }
     }
 }
+
