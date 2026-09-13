@@ -30,7 +30,7 @@ public static class FFLogsRegionExtensions
     /// <summary>
     /// Display names for UI combo boxes, indexed by combo position.
     /// </summary>
-    public static readonly string[] DisplayNames = { "中国 (CN)", "北美 (NA)", "欧洲 (EU)", "日本 (JP)", "大洋洲 (OC)" };
+    public static readonly string[] DisplayNames = { "CN", "NA", "EU", "JP", "OC" };
 
     /// <summary>
     /// Maps combo index to the serverOrRegion API value.
